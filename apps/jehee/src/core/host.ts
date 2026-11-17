@@ -10,6 +10,7 @@ import {
 	createRegistry,
 	type Extension,
 	Harness,
+	LiveDoc,
 	MemoryStorage,
 	type ModelRef,
 	type Registry,
@@ -23,8 +24,11 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import { createMemoryExtension } from "../memory/bridge.ts";
 import { extractAssistantText, extractUserText, type MemoryProvider } from "../memory/contract.ts";
 
-/** Storage backend configuration for JeheeHost. */
-export type JeheeStorageConfig = { readonly kind: "memory" } | { readonly kind: "sqlite"; readonly path: string };
+/** Storage backend configuration for JeheeHost (supports memory, local SQLite, or custom edge/DO storage). */
+export type JeheeStorageConfig =
+	| { readonly kind: "memory" }
+	| { readonly kind: "sqlite"; readonly path: string }
+	| { readonly kind: "custom"; readonly storage: Storage };
 
 /** Construction options for opening a JeheeHost instance. */
 export type JeheeHostOptions = {
@@ -92,7 +96,11 @@ export class JeheeHost {
 	/** Opens storage, installs extensions and memory, initializes or reattaches the root conversation, and resumes pending tasks. */
 	static async open(options: JeheeHostOptions, context: Context): Promise<JeheeHost> {
 		const storage: Storage =
-			options.storage.kind === "memory" ? new MemoryStorage() : await openNodeSqliteStorage(options.storage.path);
+			options.storage.kind === "memory"
+				? new MemoryStorage()
+				: options.storage.kind === "sqlite"
+					? await openNodeSqliteStorage(options.storage.path)
+					: options.storage.storage;
 		const registry = createRegistry();
 		for (const ext of options.extensions ?? []) {
 			registry.install(ext);
@@ -203,6 +211,17 @@ export class JeheeHost {
 			}
 		}
 		return history;
+	}
+
+	/** Whether the root conversation currently has a live run in flight. */
+	async isBusy(context: Context): Promise<boolean> {
+		const live = await this.#harness.snapshot(LiveDoc, this.#root.id, context);
+		return live?.run !== undefined;
+	}
+
+	/** Withdraws queued inputs, aborts active foreground work on the root conversation, and waits until idle. */
+	async abort(context: Context): Promise<void> {
+		await this.#root.abort(context);
 	}
 
 	/** Waits until the root conversation and its foreground tasks are completely idle (including afterRun hooks). */

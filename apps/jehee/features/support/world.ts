@@ -9,6 +9,7 @@ import type { FauxResponseStep, Message, TranscriptContext } from "@earendil-wor
 import { createModels } from "@earendil-works/pi-ai/models";
 import { type FauxProviderHandle, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import type { Extension } from "@earendil-works/pi-durable";
+import type { ChannelGateway } from "../../src/channels/gateway.ts";
 import { JeheeHost, type JeheePendingTurn, type JeheeTurnReply } from "../../src/core/host.ts";
 import type { MemoryProvider } from "../../src/memory/contract.ts";
 import type { StaticCoreMemoryProvider } from "../../src/memory/static-core.ts";
@@ -31,6 +32,11 @@ export class JeheeWorld extends World {
 	toolEntered: Promise<void> | undefined;
 	releaseSlowTool: (() => void) | undefined;
 	customExtensions: Extension[] = [];
+	gateway: ChannelGateway | undefined;
+	webhookSecret: string | undefined;
+	lastWebhookResponse: Response | undefined;
+	telegramSent: Array<{ readonly chatId: string; readonly text: string }> = [];
+	qqSent: Array<{ readonly chatId: string; readonly text: string }> = [];
 
 	constructor(options: ConstructorParameters<typeof World>[0]) {
 		super(options);
@@ -107,6 +113,10 @@ export class JeheeWorld extends World {
 
 	/** Cleans up any running host and temporary SQLite directory after each scenario. */
 	async cleanup(): Promise<void> {
+		if (this.gateway !== undefined) {
+			this.gateway.dispose();
+			this.gateway = undefined;
+		}
 		if (this.releaseSlowTool !== undefined) {
 			this.releaseSlowTool();
 			this.releaseSlowTool = undefined;
