@@ -42,11 +42,11 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [ADR-0001](./adr/0001-foundation-and-repo-isolation.md) | 基座选型（`@earendil-works/pi-durable`）与上游源码隔离策略 | Accepted | 2026-11-18 | 确立从 `earendil-works/pi` Fork 构建 `jehee`，采用 `apps/jehee` Workspace 物理隔离上游源码、防误推双远端配置及薄胶水层隔离 Experimental API。 |
 | [ADR-0002](./adr/0002-host-skeleton-and-bdd-cucumber.md) | 最小常驻宿主骨架（`JeheeHost`）与 BDD + Cucumber 验收体系设计 | Accepted | 2026-11-18 | 设计 Slice 1 宿主内核、可热插拔 `MemoryProvider` 防腐接口，以及基于 `@cucumber/cucumber` + Node 24 原生 TS + `fauxProvider` 的确定性 BDD 验收架构。 |
 | [ADR-0003](./adr/0003-cloud-topology-and-channel-gateway.md) | 双栖云拓扑（Cloudflare DO + InstaBox Free）与平台无关渠道网关（Telegram 首发） | Accepted | 2026-11-18 | 确立本地/CF DO 双栖控制面 + InstaBox 免费单机多 Worktree 云工坊拓扑；实现平台无关 `ChannelGateway`（白名单、防抖合并、Staging 锁、跨平台共用会话）与零依赖纯 `fetch` Telegram 适配器。 |
+| [ADR-0004](./adr/0004-instabox-cloud-workshop.md) | InstaBox 免费版云工坊板块（按需唤醒、`/data` 多 Worktree 隔离与后台协同治理） | Accepted | 2026-11-18 | 基于纯 `fetch` 对接 InstaBox OpenAPI v1，实现免费单机透明唤醒、`/data/jehee/worktrees` Git Worktree 隔离、仅继承 Core 记忆的后台子会话及跨渠道完工主动回推。 |
 
 ---
 
 ## 3. 后续计划立项队列
 
-- **ADR-0004（Slice 3）**：InstaBox 免费版云工坊板块（HTTPS 唤醒恢复 + `/data` 多 Git Worktree 编排 + 后台子会话完工回执）。
 - **ADR-0005（Slice 4）**：四层抽屉记忆（Core / 中期时序 / 短期任务缓存 / 历史压缩抽屉）与甜点区间窗口治理。
-- **ADR-0006（Slice 5）**：确定性主动提醒门控与可插拔记忆层的横向对比 Eval 套件（产品核心成型后启动）。
+- **ADR-0006（Slice 5）**：确定性主动提醒门控、可运行部署入口（CLI / Wrangler Worker）与记忆层横向对比 Eval 套件。

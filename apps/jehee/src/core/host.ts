@@ -8,6 +8,7 @@ import {
 	type Conversation,
 	type ConversationId,
 	createRegistry,
+	type EntryId,
 	type Extension,
 	Harness,
 	LiveDoc,
@@ -23,12 +24,21 @@ import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { createMemoryExtension } from "../memory/bridge.ts";
 import { extractAssistantText, extractUserText, type MemoryProvider } from "../memory/contract.ts";
+import { createWorkshopBundle, type WorkshopBundle, WorkshopRegistryDoc } from "../workshop/extension.ts";
+import type { InstaBoxClient } from "../workshop/instabox-client.ts";
+import type { WorkshopProvisioner } from "../workshop/provisioner.ts";
 
 /** Storage backend configuration for JeheeHost (supports memory, local SQLite, or custom edge/DO storage). */
 export type JeheeStorageConfig =
 	| { readonly kind: "memory" }
 	| { readonly kind: "sqlite"; readonly path: string }
 	| { readonly kind: "custom"; readonly storage: Storage };
+
+/** Optional cloud workshop configuration attached to JeheeHost. */
+export type JeheeWorkshopOptions = {
+	readonly client: InstaBoxClient;
+	readonly provisioner: WorkshopProvisioner;
+};
 
 /** Construction options for opening a JeheeHost instance. */
 export type JeheeHostOptions = {
@@ -37,6 +47,7 @@ export type JeheeHostOptions = {
 	readonly defaultModel: ModelRef;
 	readonly instructions?: string;
 	readonly memory?: MemoryProvider;
+	readonly workshop?: JeheeWorkshopOptions;
 	readonly extensions?: readonly Extension[];
 	readonly cwd?: string;
 };
@@ -53,6 +64,7 @@ export type JeheeTurnReply =
 	| {
 			readonly submissionId: SubmissionId;
 			readonly status: "done";
+			readonly answerEntryId: EntryId;
 			readonly replyText: string;
 	  }
 	| {
@@ -79,6 +91,7 @@ export class JeheeHost {
 	readonly #harness: Harness;
 	readonly #registry: Registry;
 	readonly #root: Conversation;
+	readonly #proactiveListeners = new Set<(replyText: string) => void | Promise<void>>();
 	#memoryProvider: MemoryProvider | undefined;
 
 	private constructor(
@@ -86,11 +99,13 @@ export class JeheeHost {
 		registry: Registry,
 		root: Conversation,
 		memoryProvider: MemoryProvider | undefined,
+		proactiveListeners: Set<(replyText: string) => void | Promise<void>>,
 	) {
 		this.#harness = harness;
 		this.#registry = registry;
 		this.#root = root;
 		this.#memoryProvider = memoryProvider;
+		this.#proactiveListeners = proactiveListeners;
 	}
 
 	/** Opens storage, installs extensions and memory, initializes or reattaches the root conversation, and resumes pending tasks. */
@@ -102,11 +117,26 @@ export class JeheeHost {
 					? await openNodeSqliteStorage(options.storage.path)
 					: options.storage.storage;
 		const registry = createRegistry();
+		const proactiveListeners = new Set<(replyText: string) => void | Promise<void>>();
 		for (const ext of options.extensions ?? []) {
 			registry.install(ext);
 		}
 		if (options.memory !== undefined) {
 			registry.install(createMemoryExtension(options.memory));
+		}
+		let workshopBundle: WorkshopBundle | undefined;
+		if (options.workshop !== undefined) {
+			workshopBundle = createWorkshopBundle({
+				client: options.workshop.client,
+				provisioner: options.workshop.provisioner,
+				onProactiveReply: async (replyText) => {
+					for (const listener of proactiveListeners) {
+						await listener(replyText);
+					}
+				},
+			});
+			registry.install(workshopBundle.orchestratorExtension);
+			registry.install(workshopBundle.sandboxExtension);
 		}
 		const defaultCwd = options.cwd ?? process.cwd();
 		const harness = await Harness.open(
@@ -127,6 +157,7 @@ export class JeheeHost {
 				model: options.defaultModel,
 				instructions: options.instructions,
 				cwd: options.cwd,
+				...(workshopBundle !== undefined ? { extensions: { remove: [workshopBundle.sandboxExtension] } } : {}),
 			},
 		});
 		await root.configure(
@@ -134,11 +165,12 @@ export class JeheeHost {
 				model: options.defaultModel,
 				...(options.instructions !== undefined ? { instructions: options.instructions } : {}),
 				...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+				...(workshopBundle !== undefined ? { extensions: { remove: [workshopBundle.sandboxExtension] } } : {}),
 			},
 			context,
 		);
 		harness.resume();
-		return new JeheeHost(harness, registry, root, options.memory);
+		return new JeheeHost(harness, registry, root, options.memory, proactiveListeners);
 	}
 
 	/** Identifier of the single-entry root conversation. */
@@ -179,6 +211,7 @@ export class JeheeHost {
 					return {
 						submissionId: submission.id,
 						status: "done",
+						answerEntryId: settled.answer,
 						replyText,
 					};
 				}
@@ -213,15 +246,32 @@ export class JeheeHost {
 		return history;
 	}
 
-	/** Whether the root conversation currently has a live run in flight. */
+	/** Whether the root conversation is actively generating or running tools (excludes post-answer `afterRun` cleanup). */
 	async isBusy(context: Context): Promise<boolean> {
 		const live = await this.#harness.snapshot(LiveDoc, this.#root.id, context);
-		return live?.run !== undefined;
+		return live?.run !== undefined && live.run.afterRun === undefined;
 	}
 
 	/** Withdraws queued inputs, aborts active foreground work on the root conversation, and waits until idle. */
 	async abort(context: Context): Promise<void> {
 		await this.#root.abort(context);
+	}
+
+	/** Subscribes to unsolicited main-agent replies produced after background workshop reports arrive. */
+	onProactiveReply(listener: (replyText: string) => void | Promise<void>): () => void {
+		this.#proactiveListeners.add(listener);
+		return () => {
+			this.#proactiveListeners.delete(listener);
+		};
+	}
+
+	/** Waits until all background workshop reporter tasks and the root conversation have completely settled. */
+	async waitForWorkshopSettled(context: Context): Promise<void> {
+		const workshopState = await this.#harness.snapshot(WorkshopRegistryDoc, this.#root.id, context);
+		for (const reporterId of Object.values(workshopState?.reporters ?? {})) {
+			await this.#harness.waitForTask(reporterId, context);
+		}
+		await this.#root.waitForIdle(context);
 	}
 
 	/** Waits until the root conversation and its foreground tasks are completely idle (including afterRun hooks). */

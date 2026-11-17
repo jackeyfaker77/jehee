@@ -50,6 +50,8 @@ export class ChannelGateway {
 	readonly #stagingRoutes: ReadonlySet<string> | undefined;
 	readonly #transports = new Map<string, ChannelTransport>();
 	readonly #buckets = new Map<string, CoalesceBucket>();
+	readonly #deliveredAnswerIds = new Set<number>();
+	readonly #unsubscribeProactive: () => void;
 	#lastActiveRoute: ChannelRoute | undefined;
 	#blockedStagingDeliveries = 0;
 
@@ -61,6 +63,11 @@ export class ChannelGateway {
 			options.stagingAllowedRoutes !== undefined && options.stagingAllowedRoutes.length > 0
 				? new Set(options.stagingAllowedRoutes)
 				: undefined;
+		this.#unsubscribeProactive = this.#host.onProactiveReply(async (replyText) => {
+			if (this.#lastActiveRoute !== undefined) {
+				await this.pushMessage(this.#lastActiveRoute, replyText);
+			}
+		});
 	}
 
 	/** Most recent authorized route that interacted with Jehee, used as default target for background notifications. */
@@ -130,8 +137,9 @@ export class ChannelGateway {
 		return this.#deliverOutbound(route.channel, route.chatId, text, options);
 	}
 
-	/** Cancels any pending debounce timers cleanly during shutdown. */
+	/** Cancels any pending debounce timers and detaches background listeners cleanly during shutdown. */
 	dispose(): void {
+		this.#unsubscribeProactive();
 		for (const bucket of this.#buckets.values()) {
 			if (bucket.timer !== undefined) clearTimeout(bucket.timer);
 		}
@@ -229,7 +237,9 @@ export class ChannelGateway {
 			context,
 		);
 		if (outcome.status === "done") {
-			if (outcome.replyText.trim().length > 0 && params.whenBusy !== "steer") {
+			const numericAnswerId = Number(outcome.answerEntryId);
+			if (outcome.replyText.trim().length > 0 && !this.#deliveredAnswerIds.has(numericAnswerId)) {
+				this.#deliveredAnswerIds.add(numericAnswerId);
 				await this.#deliverOutbound(params.channel, params.chatId, outcome.replyText, {
 					replyToMessageId: params.replyToMessageId,
 				});
