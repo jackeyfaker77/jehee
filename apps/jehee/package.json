@@ -1,0 +1,27 @@
+{
+	"name": "@jehee/bot",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Jehee: always-on personal colleague bot built on pi-durable",
+	"type": "module",
+	"scripts": {
+		"check": "node ../../scripts/biome-check.mjs && tsc --noEmit",
+		"format": "node ../../scripts/biome-check.mjs --write",
+		"test": "npm run test:unit && npm run test:bdd",
+		"test:unit": "node --conditions=source --disable-warning=ExperimentalWarning --test --test-reporter=spec \"test/*.test.ts\"",
+		"test:bdd": "node --conditions=source --disable-warning=ExperimentalWarning scripts/run-bdd.ts"
+	},
+	"engines": {
+		"node": ">=24.4.0"
+	},
+	"dependencies": {
+		"@earendil-works/chord": "1.5.2",
+		"@earendil-works/pi-ai": "1.5.2",
+		"@earendil-works/pi-durable": "1.5.2",
+		"@earendil-works/pi-schema": "1.5.2",
+		"@earendil-works/pi-telemetry": "1.5.2"
+	},
+	"devDependencies": {
+		"@cucumber/cucumber": "13.3.0"
+	}
+}
