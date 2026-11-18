@@ -37,6 +37,8 @@ export type JeheeWorkerEnv = {
 	readonly INSTABOX_MACHINE_ID?: string;
 	readonly INSTABOX_BASE_URL?: string;
 	readonly INSTABOX_WORKTREES_ROOT?: string;
+	readonly JEHEE_MCP_SERVERS?: string;
+	readonly JEHEE_MCP_EXPOSURE?: string;
 };
 
 const RECOVERY_HEARTBEAT_MS = 60_000;
@@ -102,6 +104,7 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 					defaultModel: config.defaultModel,
 					instructions: config.instructions,
 					memory,
+					...(config.mcp !== undefined ? { mcp: config.mcp } : {}),
 					...(workshop !== undefined ? { workshop } : {}),
 					onWake: (wake) => {
 						void this.#armAlarm(wake).catch(() => ctx.abort("Failed to arm Durable Object alarm"));

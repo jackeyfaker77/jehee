@@ -2,13 +2,16 @@
 // and runs the local Telegram `getUpdates` long-polling loop.
 
 import { mkdir, readFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import type { Context } from "@earendil-works/chord/context";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { ChannelGateway } from "../channels/gateway.ts";
 import { pollTelegramUpdatesOnce, TelegramTransport } from "../channels/telegram.ts";
 import { JeheeHost, type JeheeHostOptions } from "../core/host.ts";
+import { mergeJeheeMcpOptions, type ParsedStdioServerInput, parseMcpConfigJson } from "../mcp/config.ts";
+import type { JeheeMcpOptions } from "../mcp/contract.ts";
+import { stdioMcpServer } from "../mcp/node-stdio.ts";
 import { StaticCoreMemoryProvider } from "../memory/static-core.ts";
 import { InstaBoxClient } from "../workshop/instabox-client.ts";
 import { SingleBoxWorktreeProvisioner } from "../workshop/provisioner.ts";
@@ -59,11 +62,57 @@ export async function loadDotEnvFile(filePath: string): Promise<Record<string, s
 	return result;
 }
 
-/** Assembles a complete Node runtime (`JeheeHost` + optional `ChannelGateway` + optional InstaBox Workshop) from `env`. */
+function makeNodeStdioFactory(baseDir: string) {
+	return (entry: ParsedStdioServerInput) =>
+		stdioMcpServer({
+			...entry,
+			...(entry.cwd !== undefined ? { cwd: isAbsolute(entry.cwd) ? entry.cwd : resolve(baseDir, entry.cwd) } : {}),
+		});
+}
+
+/** Loads and merges Node MCP configuration from `JEHEE_MCP_CONFIG` / `defaultConfigPath` and `JEHEE_MCP_SERVERS`. */
+export async function loadNodeMcpOptions(options: {
+	readonly env: EnvDictionary;
+	readonly defaultConfigPath?: string;
+}): Promise<JeheeMcpOptions | undefined> {
+	const config = parseJeheeEnvConfig(options.env, {
+		stdioFactory: makeNodeStdioFactory(process.cwd()),
+	});
+
+	const explicitPath = options.env.JEHEE_MCP_CONFIG?.trim();
+	const targetPath = explicitPath && explicitPath.length > 0 ? resolve(explicitPath) : options.defaultConfigPath;
+
+	let fileMcp: JeheeMcpOptions | undefined;
+	if (targetPath !== undefined) {
+		let rawFile: string | undefined;
+		try {
+			rawFile = await readFile(targetPath, "utf8");
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT") throw error;
+			if (explicitPath && explicitPath.length > 0) {
+				throw new Error(`MCP config file specified by JEHEE_MCP_CONFIG not found: "${targetPath}"`);
+			}
+		}
+		if (rawFile !== undefined) {
+			fileMcp = parseMcpConfigJson(rawFile, {
+				env: options.env,
+				sourceLabel: targetPath,
+				...(config.mcpExposure !== undefined ? { exposureOverride: config.mcpExposure } : {}),
+				stdioFactory: makeNodeStdioFactory(dirname(targetPath)),
+			});
+		}
+	}
+
+	return mergeJeheeMcpOptions(fileMcp, config.mcp, config.mcpExposure);
+}
+
+/** Assembles a complete Node runtime (`JeheeHost` + optional `ChannelGateway` + MCP + InstaBox Workshop) from `env`. */
 export async function assembleNodeRuntime(
 	options: {
 		readonly env: EnvDictionary;
 		readonly sqlitePath: string;
+		readonly mcpConfigPath?: string;
 	},
 	context: Context,
 ): Promise<{
@@ -71,7 +120,13 @@ export async function assembleNodeRuntime(
 	readonly gateway: ChannelGateway;
 	readonly botToken?: string;
 }> {
-	const config = parseJeheeEnvConfig(options.env);
+	const config = parseJeheeEnvConfig(options.env, {
+		stdioFactory: makeNodeStdioFactory(process.cwd()),
+	});
+	const mcp = await loadNodeMcpOptions({
+		env: options.env,
+		...(options.mcpConfigPath !== undefined ? { defaultConfigPath: options.mcpConfigPath } : {}),
+	});
 	const models = createJeheeModels(options.env);
 	const memory = new StaticCoreMemoryProvider({ corePrompt: config.coreMemoryPrompt });
 
@@ -100,6 +155,7 @@ export async function assembleNodeRuntime(
 			defaultModel: config.defaultModel,
 			instructions: config.instructions,
 			memory,
+			...(mcp !== undefined ? { mcp } : {}),
 			...(workshop !== undefined ? { workshop } : {}),
 		},
 		context,

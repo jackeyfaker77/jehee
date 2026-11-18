@@ -1,6 +1,8 @@
 // Runtime environment parser shared between local Node CLI (`bin.ts`) and Cloudflare Workers (`worker.ts`).
 
 import type { ModelRef } from "@earendil-works/pi-durable";
+import { type ParsedStdioServerInput, parseMcpConfigJson, parseMcpExposureEnv } from "../mcp/config.ts";
+import type { JeheeMcpExposure, JeheeMcpOptions, JeheeMcpServerSpec } from "../mcp/contract.ts";
 import { createJeheeModels, DEFAULT_JEHEE_MODEL_SPEC, type EnvDictionary, resolveModelSpec } from "./models.ts";
 
 /** Parsed and validated configuration driving a Jehee runtime instance. */
@@ -21,6 +23,8 @@ export type JeheeRuntimeConfig = {
 		readonly baseUrl?: string;
 		readonly worktreesRoot?: string;
 	};
+	readonly mcp?: JeheeMcpOptions;
+	readonly mcpExposure?: JeheeMcpExposure;
 };
 
 const DEFAULT_JEHEE_INSTRUCTIONS =
@@ -35,7 +39,12 @@ function splitCsv(raw: string | undefined): string[] {
 }
 
 /** Parses and validates a `JeheeRuntimeConfig` from an environment dictionary. */
-export function parseJeheeEnvConfig(env: EnvDictionary): JeheeRuntimeConfig {
+export function parseJeheeEnvConfig(
+	env: EnvDictionary,
+	options?: {
+		readonly stdioFactory?: (input: ParsedStdioServerInput) => JeheeMcpServerSpec;
+	},
+): JeheeRuntimeConfig {
 	const models = createJeheeModels(env);
 	const modelSpec = env.JEHEE_MODEL?.trim() || DEFAULT_JEHEE_MODEL_SPEC;
 	const defaultModel = resolveModelSpec(modelSpec, models);
@@ -68,6 +77,18 @@ export function parseJeheeEnvConfig(env: EnvDictionary): JeheeRuntimeConfig {
 		throw new Error(`Invalid JEHEE_DEBOUNCE_MS "${rawDebounce}": must be a non-negative number`);
 	}
 
+	const mcpExposure = parseMcpExposureEnv(env.JEHEE_MCP_EXPOSURE);
+	const rawMcpJson = env.JEHEE_MCP_SERVERS?.trim();
+	const mcp =
+		rawMcpJson !== undefined && rawMcpJson.length > 0
+			? parseMcpConfigJson(rawMcpJson, {
+					env,
+					sourceLabel: "JEHEE_MCP_SERVERS",
+					...(mcpExposure !== undefined ? { exposureOverride: mcpExposure } : {}),
+					...(options?.stdioFactory !== undefined ? { stdioFactory: options.stdioFactory } : {}),
+				})
+			: undefined;
+
 	return {
 		defaultModel,
 		instructions: env.JEHEE_INSTRUCTIONS?.trim() || DEFAULT_JEHEE_INSTRUCTIONS,
@@ -76,5 +97,7 @@ export function parseJeheeEnvConfig(env: EnvDictionary): JeheeRuntimeConfig {
 		stagingAllowedRoutes: splitCsv(env.JEHEE_STAGING_ROUTES),
 		debounceMs,
 		...(instabox !== undefined ? { instabox } : {}),
+		...(mcp !== undefined ? { mcp } : {}),
+		...(mcpExposure !== undefined ? { mcpExposure } : {}),
 	};
 }

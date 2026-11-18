@@ -55,8 +55,19 @@ export async function inspectWorkerBundle(): Promise<WorkerBundleReport> {
 		}
 	}
 	for (const inputPath of Object.keys(result.metafile.inputs)) {
-		if (inputPath.replaceAll("\\", "/").includes("src/runtime/node.ts")) {
+		const normalized = inputPath.replaceAll("\\", "/");
+		if (normalized.includes("src/runtime/node.ts") || normalized.includes("src/mcp/node-stdio.ts")) {
 			throw new Error(`Cloudflare worker bundle must not pull in Node-only module "${inputPath}"`);
+		}
+	}
+	const contributingInputs = Object.values(result.metafile.outputs).flatMap((output) =>
+		Object.entries(output.inputs)
+			.filter(([, contribution]) => contribution.bytesInOutput > 0)
+			.map(([inputPath]) => inputPath.replaceAll("\\", "/")),
+	);
+	for (const retainedPath of contributingInputs) {
+		if (retainedPath.includes("mcp/src/transports/stdio.ts") || retainedPath.includes("cross-spawn")) {
+			throw new Error(`Cloudflare worker bundle retained un-treeshaken Node stdio module "${retainedPath}"`);
 		}
 	}
 

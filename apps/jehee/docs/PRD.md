@@ -2,7 +2,7 @@
 
 - **产品名称**：Jehee
 - **产品形态**：7×24 小时常驻个人伙伴型 Bot（Always-on Personal Colleague）
-- **文档状态**：Active（随各垂直切片演进同步更新）
+- **文档状态**：Active（随各垂直切片演进同步更新，v1.1）
 - **更新日期**：2026-11-18
 
 ---
@@ -37,10 +37,11 @@
 - **同窗口无感换窗（Seamless Handoff）**：
   - 当单窗口累积上下文到达注意力甜点上限时，自动携带交接摘要开启新上下文起点，用户在前端聊天框中完全无感，且历史原话仍留在底层供随时回查。
 
-### 板块二：工坊协同板块（Workshop — InstaBox 云电脑与多 Worktree 隔离）
-- **控制面与执行面分离的双栖云拓扑**：
-  - **控制面（大脑）**：兼容本地 Node SQLite 直跑与 **Cloudflare Workers Free（SQLite Durable Objects）** 24 小时零月租待命；日常问答、记忆读写、渠道收发均在此层完成，不唤醒云虚拟机。
-  - **云执行面（手脚 & 工坊）**：对接 **InstaBox（4C8G Firecracker 云电脑，20 GiB `/data` 持久化盘）**。针对免费计划单机约束，工坊在派发重任务时通过 HTTPS API 按需 `resume` 唤醒机器，并在持久化盘 `/data/jehee/worktrees/<task-id>` 下创建独立 Git Worktree 隔离各子任务（同时保留策略接口，未来可平滑切换整机 `fork`）。
+### 板块二：外部能力连接与工坊协同板块（MCP Connectors & Workshop Gateway）
+- **个人助理主定位（总管 + 连接器 + 外部 Coding Agent 网关）**：
+  - Jehee 聚焦于代表用户跨时间、跨日常应用（邮件、日历、账单、出行、健康等，对齐 PALE 场景）协调事务，**不重复造轮子替代专业 Coding Agent**；
+  - **MCP 连接器骨架**：原生支持双栖连接外部 MCP 服务（云端控制面走 HTTP MCP，本地与 PALE 评测走 `stdio` MCP），默认采用“服务摘要常驻 + `tool_search` 按需加载工具 Schema”，并支持跨应用附件资源读取与大二进制句柄无损传递（防上下文爆窗）；
+  - **工坊网关（InstaBox 云电脑与多 Worktree 隔离）**：保留控制面（Node SQLite / Cloudflare Workers Free DO）与云执行面（InstaBox 4C8G，`/data/jehee/worktrees/<task-id>`）分离架构；重型工程任务在独立目录异步执行并回推精简结论，后续可平滑切换为直接调度外部成熟 Coding Agent CLI（如 `pi` / OpenCode / Claude Code / Codex）。
 - **受控上下文共享（防噪音污染）**：
   - 工坊子 Agent **只读取基础记忆切片（如用户长期编码偏好、项目规范）与当前任务契约（Task Brief）**；
   - **绝不继承**主聊天窗口里的日常闲聊记录，工坊内部产生的几万行命令输出也**绝不倒灌**回主聊天窗口。
@@ -78,6 +79,6 @@
 | **Slice 2（已完成）** | **单入口交互网关（`ChannelGateway` + Telegram 适配器）+ 连发合并与中断控制** | 支持白名单鉴权、空闲防抖合并、忙时自动 `steer`、`/status` 与 `/stop` 确定性指令、跨渠道单根会话无缝切换。 |
 | **Slice 3（已完成）** | **云工坊板块（InstaBox 云电脑按需唤醒 + 多 Git Worktree 沙箱隔离 + 完工回执）** | 主入口可将开发/长任务派发至 `/data/jehee/worktrees/<task>`，主窗口保持无重型工具污染，子任务完工后主动向最新活跃渠道推送精简汇报。 |
 | **Slice 3.5（已完成）** | **双栖运行入口（本地 CLI / Telegram 守护进程 + Cloudflare Workers DO）+ `opencode-go` 模型目录** | 默认接入 `opencode-go`（含 34 款模型）及多厂商注册表；一套代码同时支持本地 `.env` 直跑与 Cloudflare Free Worker 零月租部署（通过 Edge 打包门禁）。 |
-| **Slice 3.6（当前）** | **Telegram 本地长轮询非阻塞两阶段入站（打通本地防抖、`steer` 与 `/stop`）** | 轮询器仅等待毫秒级准入（`admit`）即推进 `offset` 拉取下一批消息，实测跨批连发防抖、慢工具期间实时 `steer` 插话与 `/stop` 紧急叫停全部通过 BDD 验收；本地 CLI 保持精简同步交互。 |
-| **Slice 4** | **四层抽屉记忆插件与甜点窗口换窗（Handoff）治理** | 长程对话自动维持在甜点 Token 区间，跨窗口切换无感，L1-L4 分层读写与虚拟时钟过期测试全部通过。 |
-| **Slice 5** | **确定性主动门控 + 主导者定义的记忆层对比 Eval** | 接入日程/任务源主动提醒门控；对 `StaticCoreMemory` 与 `FourTierDrawerMemory` 输出召回率、幻觉率与缓存真实成本对比报告。 |
+| **Slice 3.6（已完成）** | **Telegram 本地长轮询非阻塞两阶段入站（打通本地防抖、`steer` 与 `/stop`）** | 轮询器仅等待毫秒级准入（`admit`）即推进 `offset` 拉取下一批消息，实测跨批连发防抖、慢工具期间实时 `steer` 插话与 `/stop` 紧急叫停全部通过 BDD 验收；本地 CLI 保持精简同步交互。 |
+| **Slice 4（已完成）** | **双栖 MCP 连接器骨架（`tool_search` 按需暴露 + 资源三件套 + 附件句柄 + 写门控钩子）与对比 Eval** | 支持多实例 HTTP / 本地 `stdio` MCP（对接 PALE 环境）、`list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource`、乐观锁报错透传、PDF/ICS 大附件句柄无损流转，并完成 `eager` vs `deferred` 对比评测与失败复盘归档（`Eval-0001`）。 |
+| **Slice 5（规划中）** | **确定性打扰/草稿确认门控 + 热插拔记忆渐进演进与工坊外部 Coding Agent 网关化** | 后台事件支持静默归档与高风险写操作草稿确认；基于真实使用与 PALE 场景通过对比 Eval 渐进迭代轻量记忆插件（如 SQLite 历史检索 + 可读文档），并将工坊执行器演进为外部 Coding Agent 网关。 |

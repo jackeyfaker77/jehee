@@ -8,10 +8,17 @@ import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { McpConnectorHub } from "./src/mcp/hub.ts";
 import { createJeheeModels } from "./src/runtime/models.ts";
-import { assembleNodeRuntime, loadDotEnvFile, runTelegramPollingDaemon } from "./src/runtime/node.ts";
+import {
+	assembleNodeRuntime,
+	loadDotEnvFile,
+	loadNodeMcpOptions,
+	runTelegramPollingDaemon,
+} from "./src/runtime/node.ts";
 
 const appDir = resolve(dirname(fileURLToPath(import.meta.url)));
+const defaultMcpConfigPath = join(appDir, "mcp.json");
 
 async function main(): Promise<void> {
 	const dotEnv = await loadDotEnvFile(join(appDir, ".env"));
@@ -36,10 +43,39 @@ async function main(): Promise<void> {
 		return;
 	}
 
+	if (subcommand === "mcp") {
+		const mcp = await loadNodeMcpOptions({
+			env: mergedEnv,
+			defaultConfigPath: defaultMcpConfigPath,
+		});
+		if (mcp === undefined) {
+			console.log(
+				`No MCP servers configured. Copy mcp.example.json to ${defaultMcpConfigPath} or set JEHEE_MCP_SERVERS.`,
+			);
+			return;
+		}
+		console.log(`Connecting ${mcp.servers.length} MCP server(s) [exposure=${mcp.exposure ?? "deferred"}]...`);
+		const hub = await McpConnectorHub.connect(mcp.servers);
+		try {
+			for (const srv of hub.servers()) {
+				const toolNames = srv.tools.map((t) => t.name).join(", ") || "none";
+				console.log(
+					`- ${srv.name}: ${srv.tools.length} tool(s), resources=${srv.hasResources}${srv.summary ? ` — ${srv.summary}` : ""}\n    tools: ${toolNames}`,
+				);
+			}
+		} finally {
+			await hub.close();
+		}
+		return;
+	}
+
 	const sqlitePath = mergedEnv.JEHEE_SQLITE_PATH?.trim() || join(appDir, ".jehee-data", "jehee.sqlite");
 
 	if (subcommand === "chat") {
-		const { host, gateway } = await assembleNodeRuntime({ env: mergedEnv, sqlitePath }, BACKGROUND_CONTEXT);
+		const { host, gateway } = await assembleNodeRuntime(
+			{ env: mergedEnv, sqlitePath, mcpConfigPath: defaultMcpConfigPath },
+			BACKGROUND_CONTEXT,
+		);
 		gateway.registerTransport({
 			channel: "cli",
 			sendText: async (_chatId, text) => {
@@ -75,7 +111,10 @@ async function main(): Promise<void> {
 	}
 
 	if (subcommand === "telegram") {
-		const { host, gateway, botToken } = await assembleNodeRuntime({ env: mergedEnv, sqlitePath }, BACKGROUND_CONTEXT);
+		const { host, gateway, botToken } = await assembleNodeRuntime(
+			{ env: mergedEnv, sqlitePath, mcpConfigPath: defaultMcpConfigPath },
+			BACKGROUND_CONTEXT,
+		);
 		if (botToken === undefined) {
 			gateway.dispose();
 			await host.close(BACKGROUND_CONTEXT);
@@ -102,6 +141,7 @@ async function main(): Promise<void> {
 			"",
 			"Commands:",
 			"  models [provider]   List available models (e.g. `models opencode-go`)",
+			"  mcp                 Verify configured MCP servers (handshake, tools, and resources)",
 			"  chat                Interactive local terminal chat backed by SQLite",
 			"  telegram            Start persistent Telegram getUpdates long-polling bot",
 		].join("\n"),

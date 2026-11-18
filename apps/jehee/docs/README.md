@@ -18,15 +18,17 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
    - **Why（为什么这么设计 & 淘汰了什么）**：对比备选方案，写明取舍理由。
    - **How（具体怎么设计）**：模块边界、TypeScript 接口签名、状态流向与目录结构。
    - **Verification & Risks（风险与验收标准）**：风险缓冲机制、回退路径与对应的 BDD 验收场景。
-3. **行为驱动规格（BDD + Cucumber）**
+3. **可观测性埋点与指标口径锁定（Observability & Metric Dictionary）**
+   在编写评测与复杂能力前，先打通父子 Span 决策树（`pi-telemetry`）并锁定统一指标公式，确保任何功能改动与策略切换均可被白盒追踪。
+4. **行为驱动规格（BDD + Cucumber）**
    在 `apps/jehee/features/*.feature` 中使用 Gherkin 编写业务可读的可执行验收规格（`Feature / Scenario / Given / When / Then`），覆盖正常流、忙时插话、崩溃恢复与插件替换边界。
-4. **垂直切片实现（Vertical Slice Implementation）**
+5. **垂直切片实现（Vertical Slice Implementation）**
    - 严守上游隔离原则：业务代码仅落在 `apps/jehee/` 内，不直接污染上游 `packages/*`。
    - 严守根仓编码规范（见根目录 [`AGENTS.md`](../../../AGENTS.md)）：仅使用可擦除 TypeScript 语法（Node 24 strip-types 兼容）、顶层静态导入、禁用无依据的 `any`、所有依赖精确锁定版本号。
-5. **静态门禁与自动化验收（Check & BDD Gate）**
-   运行 Biome 格式/静态检查、TypeScript 类型检查、依赖精确锁定检查，以及 Cucumber BDD 全量验收测试。
-6. **后期专项调优（Targeted Eval，产品主体就绪后介入）**
-   当产品核心闭环稳定后，针对记忆策略等存在多种启发式方案的可插拔模块，由项目主导者定义评测维度进行对比选型。
+6. **静态门禁与自动化验收（Check & BDD Gate）**
+   运行 Biome 格式/静态检查、TypeScript 类型检查、Worker 边缘打包纯净度检查、依赖精确锁定检查，以及 Cucumber BDD 全量验收测试。
+7. **对比评测与五类失败复盘（Comparative Eval & Failure Postmortem）**
+   针对工具暴露模式、附件流转、记忆策略等存在取舍空间的部件，基于统一指标口径运行 A/B 对比实验，并将未满分样本导出完整决策树归入标准根因桶。
 
 ---
 
@@ -45,10 +47,51 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [ADR-0004](./adr/0004-instabox-cloud-workshop.md) | InstaBox 免费版云工坊板块（按需唤醒、`/data` 多 Worktree 隔离与后台协同治理） | Accepted | 2026-11-18 | 基于纯 `fetch` 对接 InstaBox OpenAPI v1，实现免费单机透明唤醒、`/data/jehee/worktrees` Git Worktree 隔离、仅继承 Core 记忆的后台子会话及跨渠道完工主动回推。 |
 | [ADR-0005](./adr/0005-runtime-entrypoints-and-opencode-go.md) | 双栖真机运行入口（本地 CLI / Telegram 轮询 + Cloudflare DO）与 OpenCode Go 模型装配 | Accepted | 2026-11-18 | 纯化 `JeheeHost` 跨平台内核，原生接入 `opencode-go` 模型目录，交付本地 `bin.ts`（`models`/`chat`/`telegram`）与 Cloudflare `worker.ts` + `wrangler.jsonc` 部署入口及边缘打包门禁。 |
 | [ADR-0006](./adr/0006-nonblocking-telegram-polling-and-cli-boundary.md) | Telegram 本地长轮询非阻塞两阶段入站与本地 CLI 同步边界 | Accepted | 2026-11-18 | 将 `ChannelGateway` 拆分为有序毫秒级准入 `admit` 与后台结算 `settled`，打通本地 Telegram 轮询下的连发防抖、忙时实时 `steer` 插话与 `/stop` 紧急中止，同时明确本地 CLI 保持精简同步交互。 |
+| [ADR-0007](./adr/0007-mcp-connector-skeleton-and-eval.md) | 双栖 MCP 连接器骨架、Trace 可观测性与暴露策略对比 Eval | Accepted | 2026-11-18 | 打通 `JeheeHost` 父子 Span 决策树与标准指标字典；基于 `@earendil-works/pi-mcp` 与 `tool_search` 构建双栖多实例 MCP 连接器、资源三工具与大附件句柄暂存，并落地 `eager` vs `deferred` 对比 Eval 与五类失败复盘。 |
+
+### 评测结论与失败复盘记录（Evals & Postmortems）
+
+| 编号 | 标题 | 关联 ADR | 日期 | 核心结论摘要 |
+| :--- | :--- | :--- | :--- | :--- |
+| [Eval-0001](./evals/0001-mcp-exposure-and-blob-postmortem.md) | MCP 工具暴露策略与二进制附件句柄对比评测及失败复盘 | [ADR-0007](./adr/0007-mcp-connector-skeleton-and-eval.md) | 2026-11-18 | `opencode-go/deepseek-v4.1-flash` 真机与离线双轨实测：70 工具拓扑下默认 `deferred + $jehee_blob:` 相比基线降低 **95.2% 输入 Token**（`492,557 -> 23,648`）、**96.0% 真实账单**（`\$0.03791 -> \$0.00152`）与 **90.6% 耗时**（`342.1s -> 32.1s`），消除 20 KiB 截断诱发的思考螺旋与 `integrity_mismatch`。 |
 
 ---
 
-## 3. 后续计划立项队列
+## 3. 可观测性、标准指标口径与失败复盘规范
 
-- **ADR-0007（Slice 4）**：四层抽屉记忆（Core / 中期时序 / 短期任务缓存 / 历史压缩抽屉）与甜点区间窗口治理。
-- **ADR-0008（Slice 5）**：确定性主动提醒门控与可插拔记忆层的横向对比 Eval 套件（由项目主导者定调评测维度）。
+### 3.1 Trace 决策树分层（基于 `@earendil-works/pi-telemetry`）
+
+一次外部请求或任务对应该回合的一条完整 `StoredTrace`，父子 Span 结构固定为：
+- `pi.durable.submit`（根 Span：记录 `conversation.id`、`submission.id`、`answer.entry_id`）
+  - `pi.durable.phase`（`task.name="pi.generation"`：每轮模型推理阶段）
+    - `pi.ai.request`（记录 `model`、`stop`、`usage.input`、`usage.output`、`usage.cache_read`、`usage.cache_write`、`cost.total` 及首字事件 `pi.ai.first_chunk`）
+  - `pi.durable.phase`（`task.name="pi.tool"`：每次工具执行，记录 `tool.name`、`tool.call_id`、`outcome`）
+    - `jehee.mcp.call` / `jehee.mcp.resource_read`（MCP 子 Span：记录 `server`、`tool`/`uri`、`mcp.status`、`is_error`、`blob.offloaded_bytes`、`gate.action`）
+
+### 3.2 统一指标口径（Metric Dictionary）
+
+注意 `@earendil-works/pi-ai` 中 `usage.input` 表示**未命中缓存的新增输入 Token**，所有统计与 Eval 报告统一按以下公式计算：
+- `prefill_tokens = usage.input + usage.cache_read + usage.cache_write`
+- `cache_hit_rate = usage.cache_read / prefill_tokens`（当 `prefill_tokens === 0` 时记为 `0`）
+- `post_warmup_cache_hit_rate`：仅统计同一任务第 2 轮及之后的 `pi.ai.request` 的 `cache_read / prefill_tokens`，排除首轮冷启动影响，用于检测前缀破坏 Bug
+- `llm_turns`：该 Trace 内 `pi.ai.request` Span 总数
+- `tool_calls`：该 Trace 内 `task.name === "pi.tool"` 的 Span 总数（其中单列 `tool_search_calls` 与 `mcp_calls`）
+- `ttft_p50_ms`：`pi.ai.first_chunk` 相对请求起点的延迟中位数
+- `wall_time_ms`：根 Span 起止耗时（毫秒）
+- `cost_usd`：所有 `pi.ai.request` 的 `cost.total` 之和
+- 质量门禁指标：`pass_rate`（全门禁通过率）、`rubric_score`（分步得分均值）、`error_recovery_rate`（遇到 `stale_version` 等可恢复报错后最终提交成功的比例）、`boundary_violations`（越权或未确认即触发高风险写操作的次数）
+
+### 3.3 五类失败复盘根因桶（Failure Root-Cause Taxonomy）
+
+任何未达到满分的 Eval 样本均须自动产出复盘视图（`renderTrace` 决策树 + 关联的工具调用详情 + 状态快照差异），并归入以下 5 类标准根因之一：
+1. `discovery_miss`：`tool_search` 未检索出目标工具 -> 优化工具描述或摘要目录；
+2. `arg_or_version_error`：工具参数或乐观锁版本号传错且未能自愈 -> 检查报错结构透传或 Schema 归一化；
+3. `payload_overflow`：大输出或二进制附件挤占窗口导致信息丢失 -> 调整输出截断或 Blob 句柄阈值；
+4. `boundary_violation`：未经用户确认执行不可逆写操作或越权访问 -> 加厚确定性 `beforeWriteToolCall` 门控；
+5. `model_reasoning`：工具、报错与上下文均完整准确，纯属当前模型推理失误 -> 不堆砌手写补偿规则，保留作为换强模型的代际增益对照题。
+
+---
+
+## 4. 后续计划立项队列
+
+- **ADR-0008（Slice 5）**：确定性外发/静默门控、热插拔记忆的 Eval 驱动渐进演进，以及工坊对接外部 Coding Agent CLI 网关化。

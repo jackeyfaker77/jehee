@@ -202,7 +202,18 @@ export class ChannelGateway {
 		}
 		const busy = await this.#host.isBusy(context);
 		const memoryId = this.#host.memoryProvider?.id ?? "none";
-		const statusText = `status: ${busy ? "busy" : "idle"}\nconversation: ${String(this.#host.rootConversationId)}\nmemory: ${memoryId}`;
+		const mcpServers = this.#host.mcpServerNames;
+		const mcpLabel = mcpServers.length > 0 ? mcpServers.join(", ") : "none";
+		const usage = await this.#host.getUsageSummary(context);
+		const cachePct = (usage.cacheHitRate * 100).toFixed(1);
+		const statusText = [
+			`status: ${busy ? "busy" : "idle"}`,
+			`conversation: ${String(this.#host.rootConversationId)}`,
+			`memory: ${memoryId}`,
+			`mcp: ${mcpLabel}`,
+			`cache_hit: ${cachePct}% (prefill=${usage.prefillTokens})`,
+			`cost_usd: ${usage.costUsd.toFixed(6)}`,
+		].join("\n");
 		await this.#deliverOutbound(message.channel, message.chatId, statusText, {
 			replyToMessageId: message.messageId,
 		});

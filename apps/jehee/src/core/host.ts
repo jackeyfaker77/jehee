@@ -20,9 +20,14 @@ import {
 	type Storage,
 	type Submission,
 	type SubmissionId,
+	UsageDoc,
 	UserEntry,
 	type Wake,
 } from "@earendil-works/pi-durable";
+import type { TelemetryContext } from "@earendil-works/pi-telemetry";
+import type { JeheeMcpOptions } from "../mcp/contract.ts";
+import { createMcpBundle } from "../mcp/extension.ts";
+import { McpConnectorHub } from "../mcp/hub.ts";
 import { createMemoryExtension } from "../memory/bridge.ts";
 import { extractAssistantText, extractUserText, type MemoryProvider } from "../memory/contract.ts";
 import { createWorkshopBundle, type WorkshopBundle, WorkshopRegistryDoc } from "../workshop/extension.ts";
@@ -45,12 +50,25 @@ export type JeheeHostOptions = {
 	readonly defaultModel: ModelRef;
 	readonly instructions?: string;
 	readonly memory?: MemoryProvider;
+	readonly mcp?: JeheeMcpOptions;
 	readonly workshop?: JeheeWorkshopOptions;
 	readonly extensions?: readonly Extension[];
+	readonly telemetry?: TelemetryContext;
 	readonly cwd?: string;
 	readonly env?: HarnessOptions["env"];
 	readonly now?: () => number;
 	readonly onWake?: (wake: Wake) => void;
+};
+
+/** Cumulative token, KV-cache hit rate, and spend summary for the root conversation. */
+export type JeheeUsageSummary = {
+	readonly inputTokens: number;
+	readonly outputTokens: number;
+	readonly cacheReadTokens: number;
+	readonly cacheWriteTokens: number;
+	readonly prefillTokens: number;
+	readonly cacheHitRate: number;
+	readonly costUsd: number;
 };
 
 /** Inbound user message delivered to the single-entry root conversation. */
@@ -96,6 +114,7 @@ export class JeheeHost {
 	readonly #registry: Registry;
 	readonly #root: Conversation;
 	readonly #proactiveListeners: Set<ProactiveReplyListener>;
+	readonly #mcpHub: McpConnectorHub | undefined;
 	#memoryProvider: MemoryProvider | undefined;
 
 	private constructor(
@@ -104,15 +123,17 @@ export class JeheeHost {
 		root: Conversation,
 		memoryProvider: MemoryProvider | undefined,
 		proactiveListeners: Set<ProactiveReplyListener>,
+		mcpHub: McpConnectorHub | undefined,
 	) {
 		this.#harness = harness;
 		this.#registry = registry;
 		this.#root = root;
 		this.#memoryProvider = memoryProvider;
 		this.#proactiveListeners = proactiveListeners;
+		this.#mcpHub = mcpHub;
 	}
 
-	/** Opens storage, installs extensions and memory, initializes or reattaches the root conversation, and resumes pending tasks. */
+	/** Opens storage, connects MCP servers, installs extensions and memory, initializes the root conversation, and resumes tasks. */
 	static async open(options: JeheeHostOptions, context: Context): Promise<JeheeHost> {
 		const storage: Storage = options.storage.kind === "memory" ? new MemoryStorage() : options.storage.storage;
 		const registry = createRegistry();
@@ -122,6 +143,14 @@ export class JeheeHost {
 		}
 		if (options.memory !== undefined) {
 			registry.install(createMemoryExtension(options.memory));
+		}
+		let mcpHub: McpConnectorHub | undefined;
+		if (options.mcp !== undefined) {
+			mcpHub = await McpConnectorHub.connect(options.mcp.servers);
+			const mcpBundle = createMcpBundle(mcpHub, options.mcp);
+			for (const ext of mcpBundle.extensions) {
+				registry.install(ext);
+			}
 		}
 		let workshopBundle: WorkshopBundle | undefined;
 		if (options.workshop !== undefined) {
@@ -137,40 +166,46 @@ export class JeheeHost {
 			registry.install(workshopBundle.orchestratorExtension);
 			registry.install(workshopBundle.sandboxExtension);
 		}
-		const harness = await Harness.open(
-			storage,
-			{
-				models: options.models,
-				registry,
-				...(options.env !== undefined ? { env: options.env } : {}),
-				...(options.now !== undefined ? { now: options.now } : {}),
-				...(options.onWake !== undefined ? { onWake: options.onWake } : {}),
-				settings: {
-					followUpMode: "all",
-					steeringMode: "all",
+		try {
+			const harness = await Harness.open(
+				storage,
+				{
+					models: options.models,
+					registry,
+					...(options.telemetry !== undefined ? { telemetry: options.telemetry } : {}),
+					...(options.env !== undefined ? { env: options.env } : {}),
+					...(options.now !== undefined ? { now: options.now } : {}),
+					...(options.onWake !== undefined ? { onWake: options.onWake } : {}),
+					settings: {
+						followUpMode: "all",
+						steeringMode: "all",
+					},
 				},
-			},
-			context,
-		);
-		const root = await harness.root(context, {
-			agent: {
-				model: options.defaultModel,
-				instructions: options.instructions,
-				cwd: options.cwd,
-				...(workshopBundle !== undefined ? { extensions: { remove: [workshopBundle.sandboxExtension] } } : {}),
-			},
-		});
-		await root.configure(
-			{
-				model: options.defaultModel,
-				...(options.instructions !== undefined ? { instructions: options.instructions } : {}),
-				...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
-				...(workshopBundle !== undefined ? { extensions: { remove: [workshopBundle.sandboxExtension] } } : {}),
-			},
-			context,
-		);
-		harness.resume();
-		return new JeheeHost(harness, registry, root, options.memory, proactiveListeners);
+				context,
+			);
+			const root = await harness.root(context, {
+				agent: {
+					model: options.defaultModel,
+					instructions: options.instructions,
+					cwd: options.cwd,
+					...(workshopBundle !== undefined ? { extensions: { remove: [workshopBundle.sandboxExtension] } } : {}),
+				},
+			});
+			await root.configure(
+				{
+					model: options.defaultModel,
+					...(options.instructions !== undefined ? { instructions: options.instructions } : {}),
+					...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+					...(workshopBundle !== undefined ? { extensions: { remove: [workshopBundle.sandboxExtension] } } : {}),
+				},
+				context,
+			);
+			harness.resume();
+			return new JeheeHost(harness, registry, root, options.memory, proactiveListeners, mcpHub);
+		} catch (error) {
+			await mcpHub?.close();
+			throw error;
+		}
 	}
 
 	/** Identifier of the single-entry root conversation. */
@@ -181,6 +216,11 @@ export class JeheeHost {
 	/** Currently mounted memory provider, if any. */
 	get memoryProvider(): MemoryProvider | undefined {
 		return this.#memoryProvider;
+	}
+
+	/** Configured names of currently connected MCP servers (empty when no MCP servers are mounted). */
+	get mcpServerNames(): readonly string[] {
+		return this.#mcpHub?.servers().map((server) => server.name) ?? [];
 	}
 
 	/** Current wake status of the underlying durable scheduler (for Cloudflare Durable Object alarms). */
@@ -289,8 +329,39 @@ export class JeheeHost {
 		await this.#root.waitForIdle(context);
 	}
 
-	/** Closes the underlying Harness and releases storage locks cleanly. */
+	/** Reads cumulative token, KV-cache hit rate, and dollar spend recorded on the root conversation. */
+	async getUsageSummary(context: Context): Promise<JeheeUsageSummary> {
+		const usageState = await this.#harness.snapshot(UsageDoc, this.#root.id, context);
+		let inputTokens = 0;
+		let outputTokens = 0;
+		let cacheReadTokens = 0;
+		let cacheWriteTokens = 0;
+		let costUsd = 0;
+		for (const usage of Object.values(usageState?.models ?? {})) {
+			inputTokens += usage.input;
+			outputTokens += usage.output;
+			cacheReadTokens += usage.cacheRead;
+			cacheWriteTokens += usage.cacheWrite;
+			costUsd += usage.cost.total;
+		}
+		const prefillTokens = inputTokens + cacheReadTokens + cacheWriteTokens;
+		return {
+			inputTokens,
+			outputTokens,
+			cacheReadTokens,
+			cacheWriteTokens,
+			prefillTokens,
+			cacheHitRate: prefillTokens > 0 ? cacheReadTokens / prefillTokens : 0,
+			costUsd,
+		};
+	}
+
+	/** Closes the underlying Harness, disconnects MCP servers, and releases storage locks cleanly. */
 	async close(context: Context): Promise<void> {
-		await this.#harness.close(context);
+		try {
+			await this.#harness.close(context);
+		} finally {
+			await this.#mcpHub?.close();
+		}
 	}
 }

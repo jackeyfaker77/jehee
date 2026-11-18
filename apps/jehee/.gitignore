@@ -1,7 +1,9 @@
 .env
 .dev.vars
+mcp.json
 .wrangler/
 .jehee-data/
+.artifacts/
 dist/
 *.sqlite
 *.sqlite-shm
