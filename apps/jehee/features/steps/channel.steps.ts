@@ -1,16 +1,27 @@
-// Cucumber step definitions for ChannelGateway, Telegram Webhook security/chunking, debouncing, Staging lock, and seamless QQ switch.
+// Cucumber step definitions for ChannelGateway, Telegram Webhook security/chunking, non-blocking long-polling,
+// debouncing, busy-turn steering, /stop emergency brake, Staging lock, and seamless QQ switch.
 
 import assert from "node:assert/strict";
 import { type DataTable, Given, Then, When } from "@cucumber/cucumber";
-import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
+import { awaitWithContext } from "@earendil-works/chord/context";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { defineExtension, defineTool } from "@earendil-works/pi-durable";
+import { obj } from "@earendil-works/pi-schema";
 import type { ChannelTransport } from "../../src/channels/contract.ts";
 import { ChannelGateway } from "../../src/channels/gateway.ts";
-import { handleTelegramWebhook, TELEGRAM_MAX_MESSAGE_LENGTH, TelegramTransport } from "../../src/channels/telegram.ts";
+import {
+	handleTelegramWebhook,
+	pollTelegramUpdatesOnce,
+	TELEGRAM_MAX_MESSAGE_LENGTH,
+	TelegramTransport,
+} from "../../src/channels/telegram.ts";
 import type { JeheeWorld } from "../support/world.ts";
 
 let generatedLongReport = "";
 let pendingCoalescePromises: Array<Promise<unknown>> = [];
 let telegramCountBeforeQQ = 0;
+let lastPollNextOffset: number | undefined;
+let slowToolStillRunningAtPollReturn = false;
 
 function createMockTelegramTransport(world: JeheeWorld): TelegramTransport {
 	const mockFetch: typeof fetch = async (input, init) => {
@@ -358,3 +369,193 @@ Then(
 		assert.ok(userTexts.includes(currentText));
 	},
 );
+
+async function simulateSingleTelegramPoll(
+	world: JeheeWorld,
+	params: {
+		readonly updateId: number;
+		readonly ownerId: string;
+		readonly chatId: string;
+		readonly text: string;
+		readonly offset?: number;
+	},
+): Promise<number | undefined> {
+	assert.ok(world.gateway);
+	const mockPollFetch: typeof fetch = async () =>
+		new Response(
+			JSON.stringify({
+				ok: true,
+				result: [
+					{
+						update_id: params.updateId,
+						message: {
+							message_id: params.updateId * 10,
+							from: { id: params.ownerId },
+							chat: { id: params.chatId, type: "private" },
+							text: params.text,
+						},
+					},
+				],
+			}),
+			{ status: 200 },
+		);
+	return pollTelegramUpdatesOnce(
+		{
+			botToken: "test-token",
+			gateway: world.gateway,
+			...(params.offset !== undefined ? { offset: params.offset } : {}),
+			fetchImpl: mockPollFetch,
+		},
+		world.ctx,
+	);
+}
+
+Given(
+	"Jehee 渠道网关已启动（挂载可控慢工具 {string}，绑定 Telegram 白名单用户 {string}）",
+	async function (this: JeheeWorld, toolName: string, ownerId: string) {
+		let markEntered!: () => void;
+		let slowToolExited = false;
+		this.toolEntered = new Promise<void>((resolve) => {
+			markEntered = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			this.releaseSlowTool = resolve;
+		});
+		const slowTool = defineTool({
+			name: toolName,
+			description: "Controllable slow tool supporting both manual release and abort cancellation",
+			parameters: obj({}),
+			execute: async (_args, _api, toolCtx) => {
+				markEntered();
+				try {
+					await awaitWithContext(gate, toolCtx);
+					return { output: [{ type: "text", text: "prod-env: healthy" }] };
+				} finally {
+					slowToolExited = true;
+				}
+			},
+		});
+		this.customExtensions = [defineExtension({ name: `test.gateway-slow.${toolName}`, tools: [slowTool] })];
+		const host = await this.openHost("memory");
+		this.gateway = new ChannelGateway({
+			host,
+			allowFrom: { telegram: [ownerId] },
+		});
+		this.gateway.registerTransport(createMockTelegramTransport(this));
+		slowToolStillRunningAtPollReturn = !slowToolExited;
+	},
+);
+
+Given(
+	"模型第一轮会调用慢工具 {string}，第二轮若未被中止则会回复 {string}",
+	function (this: JeheeWorld, toolName: string, fallbackReply: string) {
+		this.installScriptedSteps([
+			fauxAssistantMessage([fauxToolCall(toolName, {})], { stopReason: "toolUse" }),
+			fauxAssistantMessage(fallbackReply),
+		]);
+	},
+);
+
+When(
+	"Telegram 本地长轮询第 1 次拉取到主人 {string} 在会话 {string} 的消息（update_id {int}，内容 {string}）",
+	async function (this: JeheeWorld, ownerId: string, chatId: string, updateId: number, text: string) {
+		lastPollNextOffset = await simulateSingleTelegramPoll(this, {
+			updateId,
+			ownerId,
+			chatId,
+			text,
+		});
+		if (this.toolEntered !== undefined) {
+			await this.toolEntered;
+			slowToolStillRunningAtPollReturn = this.releaseSlowTool !== undefined;
+		}
+	},
+);
+
+Then(
+	"第 1 次长轮询立即返回下一个 offset {int} 且此时底层模型调用次数仍为 {int}",
+	function (this: JeheeWorld, expectedOffset: number, expectedCalls: number) {
+		assert.equal(lastPollNextOffset, expectedOffset);
+		assert.equal(this.faux.state.callCount, expectedCalls);
+	},
+);
+
+When(
+	"防抖窗口内 Telegram 本地长轮询第 2 次拉取到主人 {string} 在会话 {string} 的消息（update_id {int}，内容 {string}）",
+	async function (this: JeheeWorld, ownerId: string, chatId: string, updateId: number, text: string) {
+		lastPollNextOffset = await simulateSingleTelegramPoll(this, {
+			updateId,
+			ownerId,
+			chatId,
+			text,
+			offset: lastPollNextOffset,
+		});
+	},
+);
+
+Then(
+	"第 1 次长轮询在慢工具尚未结束时已立即返回下一个 offset {int}",
+	function (this: JeheeWorld, expectedOffset: number) {
+		assert.equal(lastPollNextOffset, expectedOffset);
+		assert.equal(slowToolStillRunningAtPollReturn, true);
+		assert.equal(this.telegramSent.length, 0);
+	},
+);
+
+When(
+	"慢工具执行期间 Telegram 本地长轮询第 2 次拉取到主人 {string} 在会话 {string} 的消息（update_id {int}，内容 {string}）",
+	async function (this: JeheeWorld, ownerId: string, chatId: string, updateId: number, text: string) {
+		assert.ok(this.host);
+		assert.equal(await this.host.isBusy(this.ctx), true);
+		lastPollNextOffset = await simulateSingleTelegramPoll(this, {
+			updateId,
+			ownerId,
+			chatId,
+			text,
+			offset: lastPollNextOffset,
+		});
+	},
+);
+
+When(
+	"慢工具阻塞期间 Telegram 本地长轮询第 2 次拉取到主人 {string} 在会话 {string} 的消息（update_id {int}，内容 {string}）",
+	async function (this: JeheeWorld, ownerId: string, chatId: string, updateId: number, text: string) {
+		assert.ok(this.host);
+		assert.equal(await this.host.isBusy(this.ctx), true);
+		lastPollNextOffset = await simulateSingleTelegramPoll(this, {
+			updateId,
+			ownerId,
+			chatId,
+			text,
+			offset: lastPollNextOffset,
+		});
+	},
+);
+
+When("等待网关后台在途任务全部结算完毕", async function (this: JeheeWorld) {
+	assert.ok(this.gateway && this.host);
+	await this.gateway.drain();
+	await this.host.waitForIdle(this.ctx);
+});
+
+When("释放网关慢工具并等待后台在途任务全部结算完毕", async function (this: JeheeWorld) {
+	assert.ok(this.releaseSlowTool && this.gateway && this.host);
+	this.releaseSlowTool();
+	this.releaseSlowTool = undefined;
+	await this.gateway.drain();
+	await this.host.waitForIdle(this.ctx);
+});
+
+Then(
+	"Telegram 会话 {string} 仅收到 {int} 条回复 {string}",
+	function (this: JeheeWorld, chatId: string, expectedCount: number, expectedReply: string) {
+		const sent = this.telegramSent.filter((item) => item.chatId === chatId);
+		assert.equal(sent.length, expectedCount, `Actual sent messages: ${JSON.stringify(sent)}`);
+		assert.equal(sent[0]?.text, expectedReply);
+	},
+);
+
+Then("主对话当前忙碌状态已恢复为空闲", async function (this: JeheeWorld) {
+	assert.ok(this.host);
+	assert.equal(await this.host.isBusy(this.ctx), false);
+});

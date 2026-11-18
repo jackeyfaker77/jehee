@@ -44,3 +44,35 @@ Feature: 平台无关单入口渠道网关与 Telegram 首发适配（Channel Ga
     When 主人 "qq-owner-1" 随后切到 QQ 会话 "qq-chat-9" 发送消息 "我刚才留的暗号是什么？"
     Then QQ 会话 "qq-chat-9" 收到回复 "你刚才在 Telegram 留下的暗号是：海风"，而 Telegram 未收到新消息
     And 最后一次发往模型的上下文同时包含之前的 "记住暗号：海风" 与当前的 "我刚才留的暗号是什么？"
+
+  Scenario: Telegram 本地长轮询跨批拉取连发短消息时非阻塞推进 offset 并合并为单次推理
+    Given Jehee 渠道网关已启动（防抖合并窗口 50 毫秒）并绑定 Telegram 白名单用户 "tg-owner-1"
+    And 预设模型回复:
+      | reply                                |
+      | 已合并执行：检查接口响应并把超时改短 |
+    When Telegram 本地长轮询第 1 次拉取到主人 "tg-owner-1" 在会话 "chat-200" 的消息（update_id 101，内容 "帮我检查一下接口响应"）
+    Then 第 1 次长轮询立即返回下一个 offset 102 且此时底层模型调用次数仍为 0
+    When 防抖窗口内 Telegram 本地长轮询第 2 次拉取到主人 "tg-owner-1" 在会话 "chat-200" 的消息（update_id 102，内容 "顺便把超时改短一点"）
+    And 等待网关后台在途任务全部结算完毕
+    Then Telegram 会话 "chat-200" 仅收到 1 条回复 "已合并执行：检查接口响应并把超时改短"
+    And 底层模型实际只被调用了 1 次，且收到的用户消息合并包含了 "帮我检查一下接口响应" 与 "顺便把超时改短一点"
+
+  Scenario: Telegram 本地长轮询在主对话执行慢工具期间实时拉取新消息并触发 steer 插话
+    Given Jehee 渠道网关已启动（挂载可控慢工具 "slow_deploy_check"，绑定 Telegram 白名单用户 "tg-owner-1"）
+    And 模型第一轮会调用慢工具 "slow_deploy_check"，第二轮在看到插话后回复 "已按你的实时插话改查预发环境"
+    When Telegram 本地长轮询第 1 次拉取到主人 "tg-owner-1" 在会话 "chat-201" 的消息（update_id 201，内容 "帮我排查线上环境的部署"）
+    Then 第 1 次长轮询在慢工具尚未结束时已立即返回下一个 offset 202
+    When 慢工具执行期间 Telegram 本地长轮询第 2 次拉取到主人 "tg-owner-1" 在会话 "chat-201" 的消息（update_id 202，内容 "写错了，先改查预发环境"）
+    And 释放网关慢工具并等待后台在途任务全部结算完毕
+    Then 首条回合与 steer 插话均完成，最终模型请求上下文中包含了插话 "写错了，先改查预发环境"
+    And Telegram 会话 "chat-201" 仅收到 1 条回复 "已按你的实时插话改查预发环境"
+
+  Scenario: Telegram 本地长轮询在主对话卡在慢工具期间实时拉取 /stop 指令并立即紧急中止
+    Given Jehee 渠道网关已启动（挂载可控慢工具 "slow_stuck_job"，绑定 Telegram 白名单用户 "tg-owner-1"）
+    And 模型第一轮会调用慢工具 "slow_stuck_job"，第二轮若未被中止则会回复 "不应出现的超时后回复"
+    When Telegram 本地长轮询第 1 次拉取到主人 "tg-owner-1" 在会话 "chat-202" 的消息（update_id 301，内容 "开始跑一个耗时检查"）
+    Then 第 1 次长轮询在慢工具尚未结束时已立即返回下一个 offset 302
+    When 慢工具阻塞期间 Telegram 本地长轮询第 2 次拉取到主人 "tg-owner-1" 在会话 "chat-202" 的消息（update_id 302，内容 "/stop"）
+    And 等待网关后台在途任务全部结算完毕
+    Then Telegram 会话 "chat-202" 仅收到 1 条回复 "已停止当前在途任务。"
+    And 主对话当前忙碌状态已恢复为空闲

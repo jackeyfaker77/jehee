@@ -91,6 +91,7 @@ async function main(): Promise<void> {
 		} finally {
 			gateway.dispose();
 			await host.close(BACKGROUND_CONTEXT);
+			await gateway.drain();
 		}
 		return;
 	}

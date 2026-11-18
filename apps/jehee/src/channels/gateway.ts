@@ -1,8 +1,9 @@
 // Single-entry channel gateway: enforces sender allowlists, Staging outbound protection, rapid-message debouncing,
-// deterministic slash commands (/status, /stop), busy-turn steering, and cross-platform root-session continuity.
+// deterministic slash commands (/status, /stop), two-phase ordered admission vs async settlement, busy-turn steering,
+// and cross-platform root-session continuity.
 
 import type { Context } from "@earendil-works/chord/context";
-import type { JeheeHost } from "../core/host.ts";
+import type { JeheeHost, JeheePendingTurn } from "../core/host.ts";
 import {
 	type ChannelRoute,
 	type ChannelSendOptions,
@@ -32,6 +33,11 @@ export type IngestResult =
 	| { readonly kind: "replied"; readonly replyText: string }
 	| { readonly kind: "unanswered"; readonly reason: string };
 
+/** Handle returned once an inbound message is durably admitted (or placed in a debounce bucket) without blocking on turn completion. */
+export type AdmittedIngest = {
+	readonly settled: Promise<IngestResult>;
+};
+
 type CoalesceBucket = {
 	readonly channel: string;
 	readonly chatId: string;
@@ -50,6 +56,7 @@ export class ChannelGateway {
 	readonly #stagingRoutes: ReadonlySet<string> | undefined;
 	readonly #transports = new Map<string, ChannelTransport>();
 	readonly #buckets = new Map<string, CoalesceBucket>();
+	readonly #inFlight = new Set<Promise<unknown>>();
 	readonly #deliveredAnswerIds = new Set<number>();
 	readonly #unsubscribeProactive: () => void;
 	#lastActiveRoute: ChannelRoute | undefined;
@@ -85,25 +92,26 @@ export class ChannelGateway {
 		this.#transports.set(transport.channel, transport);
 	}
 
-	/** Ingests one normalized platform message, applying auth, commands, debouncing, steering, and reply routing. */
-	async ingest(message: InboundChannelMessage, context: Context): Promise<IngestResult> {
+	/** Admits one normalized message in order (auth, slash commands, debounce bucket, or durable `submitMessage`) and returns its background settlement handle. */
+	async admit(message: InboundChannelMessage, context: Context): Promise<AdmittedIngest> {
 		const allowed = this.#allowFrom.get(message.channel);
 		if (allowed === undefined || !allowed.has(message.senderId)) {
-			return { kind: "unauthorized" };
+			return { settled: Promise.resolve({ kind: "unauthorized" }) };
 		}
 		const trimmed = message.text.trim();
 		if (trimmed.length === 0) {
-			return { kind: "ignored_empty" };
+			return { settled: Promise.resolve({ kind: "ignored_empty" }) };
 		}
 		this.#lastActiveRoute = { channel: message.channel, chatId: message.chatId };
 
 		if (trimmed === "/status" || trimmed === "/stop") {
-			return this.#handleCommand(trimmed, message, context);
+			const commandOutcome = await this.#handleCommand(trimmed, message, context);
+			return { settled: Promise.resolve(commandOutcome) };
 		}
 
 		const busy = await this.#host.isBusy(context);
 		if (busy) {
-			return this.#dispatchTurn(
+			return this.#admitTurn(
 				{
 					channel: message.channel,
 					chatId: message.chatId,
@@ -117,7 +125,7 @@ export class ChannelGateway {
 		}
 
 		if (this.#debounceMs <= 0) {
-			return this.#dispatchTurn(
+			return this.#admitTurn(
 				{
 					channel: message.channel,
 					chatId: message.chatId,
@@ -129,7 +137,20 @@ export class ChannelGateway {
 			);
 		}
 
-		return this.#enqueueDebounced(message, trimmed, context);
+		return { settled: this.#enqueueDebounced(message, trimmed, context) };
+	}
+
+	/** Ingests one normalized platform message and waits until its turn (or command) has settled and replied. */
+	async ingest(message: InboundChannelMessage, context: Context): Promise<IngestResult> {
+		const admitted = await this.admit(message, context);
+		return admitted.settled;
+	}
+
+	/** Waits until all currently admitted or debounced background turns and outbound deliveries have settled. */
+	async drain(): Promise<void> {
+		while (this.#inFlight.size > 0) {
+			await Promise.allSettled([...this.#inFlight]);
+		}
 	}
 
 	/** Pushes a proactive or workshop notification out through a target route, subject to the Staging outbound guard. */
@@ -140,10 +161,27 @@ export class ChannelGateway {
 	/** Cancels any pending debounce timers and detaches background listeners cleanly during shutdown. */
 	dispose(): void {
 		this.#unsubscribeProactive();
+		this.#cancelAllBuckets("disposed");
+	}
+
+	#cancelAllBuckets(reason: string): void {
 		for (const bucket of this.#buckets.values()) {
 			if (bucket.timer !== undefined) clearTimeout(bucket.timer);
+			for (const resolve of bucket.resolvers) {
+				resolve({ kind: "unanswered", reason });
+			}
 		}
 		this.#buckets.clear();
+	}
+
+	#trackInFlight<T>(promise: Promise<T>): Promise<T> {
+		const tracked = promise.finally(() => {
+			this.#inFlight.delete(tracked);
+		});
+		// Guard against unhandled rejection warnings when callers fire-and-forget `admit()`.
+		tracked.catch(() => undefined);
+		this.#inFlight.add(tracked);
+		return promise;
 	}
 
 	async #handleCommand(
@@ -152,6 +190,7 @@ export class ChannelGateway {
 		context: Context,
 	): Promise<IngestResult> {
 		if (cmd === "/stop") {
+			this.#cancelAllBuckets("aborted");
 			await this.#host.abort(context);
 			await this.#deliverOutbound(message.channel, message.chatId, "已停止当前在途任务。", {
 				replyToMessageId: message.messageId,
@@ -186,22 +225,13 @@ export class ChannelGateway {
 		if (bucket.timer !== undefined) {
 			clearTimeout(bucket.timer);
 		}
-		return new Promise<IngestResult>((resolve, reject) => {
+		const settled = new Promise<IngestResult>((resolve, reject) => {
 			bucket.resolvers.push(resolve);
 			bucket.rejecters.push(reject);
 			bucket.timer = setTimeout(() => {
 				this.#buckets.delete(routeKey);
 				const mergedText = bucket.texts.join("\n");
-				void this.#dispatchTurn(
-					{
-						channel: bucket.channel,
-						chatId: bucket.chatId,
-						requestId: `${bucket.channel}:${bucket.chatId}:${bucket.firstMessageId}`,
-						replyToMessageId: bucket.firstMessageId,
-						text: mergedText,
-					},
-					context,
-				).then(
+				void this.#flushBucket(bucket, mergedText, context).then(
 					(res) => {
 						for (const r of bucket.resolvers) r(res);
 					},
@@ -211,9 +241,26 @@ export class ChannelGateway {
 				);
 			}, this.#debounceMs);
 		});
+		return this.#trackInFlight(settled);
 	}
 
-	async #dispatchTurn(
+	async #flushBucket(bucket: CoalesceBucket, mergedText: string, context: Context): Promise<IngestResult> {
+		const busyNow = await this.#host.isBusy(context);
+		const admitted = await this.#admitTurn(
+			{
+				channel: bucket.channel,
+				chatId: bucket.chatId,
+				requestId: `${bucket.channel}:${bucket.chatId}:${bucket.firstMessageId}`,
+				replyToMessageId: bucket.firstMessageId,
+				text: mergedText,
+				...(busyNow ? { whenBusy: "steer" } : {}),
+			},
+			context,
+		);
+		return admitted.settled;
+	}
+
+	async #admitTurn(
 		params: {
 			readonly channel: string;
 			readonly chatId: string;
@@ -223,12 +270,8 @@ export class ChannelGateway {
 			readonly whenBusy?: "steer" | "followUp";
 		},
 		context: Context,
-	): Promise<IngestResult> {
-		const transport = this.#transports.get(params.channel);
-		if (transport?.sendTyping !== undefined && this.#isRouteAllowedInStaging(params.channel, params.chatId)) {
-			await transport.sendTyping(params.chatId);
-		}
-		const outcome = await this.#host.sendMessage(
+	): Promise<AdmittedIngest> {
+		const pending = await this.#host.submitMessage(
 			{
 				text: params.text,
 				requestId: params.requestId,
@@ -236,6 +279,23 @@ export class ChannelGateway {
 			},
 			context,
 		);
+		return { settled: this.#trackInFlight(this.#settleTurn(pending, params, context)) };
+	}
+
+	async #settleTurn(
+		pending: JeheePendingTurn,
+		params: {
+			readonly channel: string;
+			readonly chatId: string;
+			readonly replyToMessageId: string;
+		},
+		context: Context,
+	): Promise<IngestResult> {
+		const transport = this.#transports.get(params.channel);
+		if (transport?.sendTyping !== undefined && this.#isRouteAllowedInStaging(params.channel, params.chatId)) {
+			await transport.sendTyping(params.chatId);
+		}
+		const outcome = await pending.wait(context);
 		if (outcome.status === "done") {
 			const numericAnswerId = Number(outcome.answerEntryId);
 			if (outcome.replyText.trim().length > 0 && !this.#deliveredAnswerIds.has(numericAnswerId)) {

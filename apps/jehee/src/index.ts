@@ -8,6 +8,7 @@ export {
 	type InboundChannelMessage,
 } from "./channels/contract.ts";
 export {
+	type AdmittedIngest,
 	type ChannelAllowlist,
 	ChannelGateway,
 	type ChannelGatewayOptions,

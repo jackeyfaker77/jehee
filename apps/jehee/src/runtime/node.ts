@@ -144,6 +144,12 @@ export async function runTelegramPollingDaemon(
 					gateway: options.gateway,
 					...(offset !== undefined ? { offset } : {}),
 					timeoutSeconds: 20,
+					signal: options.signal,
+					onError: (err, msg) => {
+						if (!options.signal.aborted) {
+							console.error(`[jehee/telegram] background turn error (msg=${msg.messageId}):`, err);
+						}
+					},
 				},
 				context,
 			);

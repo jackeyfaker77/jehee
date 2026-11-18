@@ -125,13 +125,14 @@ export class JeheeWorld extends World {
 
 	/** Cleans up any running host and temporary SQLite directory after each scenario. */
 	async cleanup(): Promise<void> {
-		if (this.gateway !== undefined) {
-			this.gateway.dispose();
-			this.gateway = undefined;
-		}
 		if (this.releaseSlowTool !== undefined) {
 			this.releaseSlowTool();
 			this.releaseSlowTool = undefined;
+		}
+		if (this.gateway !== undefined) {
+			this.gateway.dispose();
+			await this.gateway.drain();
+			this.gateway = undefined;
 		}
 		if (this.host !== undefined) {
 			await this.host.close(this.ctx);

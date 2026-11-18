@@ -44,10 +44,11 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [ADR-0003](./adr/0003-cloud-topology-and-channel-gateway.md) | 双栖云拓扑（Cloudflare DO + InstaBox Free）与平台无关渠道网关（Telegram 首发） | Accepted | 2026-11-18 | 确立本地/CF DO 双栖控制面 + InstaBox 免费单机多 Worktree 云工坊拓扑；实现平台无关 `ChannelGateway`（白名单、防抖合并、Staging 锁、跨平台共用会话）与零依赖纯 `fetch` Telegram 适配器。 |
 | [ADR-0004](./adr/0004-instabox-cloud-workshop.md) | InstaBox 免费版云工坊板块（按需唤醒、`/data` 多 Worktree 隔离与后台协同治理） | Accepted | 2026-11-18 | 基于纯 `fetch` 对接 InstaBox OpenAPI v1，实现免费单机透明唤醒、`/data/jehee/worktrees` Git Worktree 隔离、仅继承 Core 记忆的后台子会话及跨渠道完工主动回推。 |
 | [ADR-0005](./adr/0005-runtime-entrypoints-and-opencode-go.md) | 双栖真机运行入口（本地 CLI / Telegram 轮询 + Cloudflare DO）与 OpenCode Go 模型装配 | Accepted | 2026-11-18 | 纯化 `JeheeHost` 跨平台内核，原生接入 `opencode-go` 模型目录，交付本地 `bin.ts`（`models`/`chat`/`telegram`）与 Cloudflare `worker.ts` + `wrangler.jsonc` 部署入口及边缘打包门禁。 |
+| [ADR-0006](./adr/0006-nonblocking-telegram-polling-and-cli-boundary.md) | Telegram 本地长轮询非阻塞两阶段入站与本地 CLI 同步边界 | Accepted | 2026-11-18 | 将 `ChannelGateway` 拆分为有序毫秒级准入 `admit` 与后台结算 `settled`，打通本地 Telegram 轮询下的连发防抖、忙时实时 `steer` 插话与 `/stop` 紧急中止，同时明确本地 CLI 保持精简同步交互。 |
 
 ---
 
 ## 3. 后续计划立项队列
 
-- **ADR-0006（Slice 4）**：四层抽屉记忆（Core / 中期时序 / 短期任务缓存 / 历史压缩抽屉）与甜点区间窗口治理。
-- **ADR-0007（Slice 5）**：确定性主动提醒门控与可插拔记忆层的横向对比 Eval 套件（由项目主导者定调评测维度）。
+- **ADR-0007（Slice 4）**：四层抽屉记忆（Core / 中期时序 / 短期任务缓存 / 历史压缩抽屉）与甜点区间窗口治理。
+- **ADR-0008（Slice 5）**：确定性主动提醒门控与可插拔记忆层的横向对比 Eval 套件（由项目主导者定调评测维度）。

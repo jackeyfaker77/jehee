@@ -170,7 +170,7 @@ export async function handleTelegramWebhook(
 	return new Response("ok", { status: 200 });
 }
 
-/** Polls Telegram `getUpdates` once and forwards all parsed messages into `gateway`, returning the next `offset`. */
+/** Polls Telegram `getUpdates` once, admits all parsed messages into `gateway` without blocking on turn completion, and returns the next `offset`. */
 export async function pollTelegramUpdatesOnce(
 	options: {
 		readonly botToken: string;
@@ -180,6 +180,8 @@ export async function pollTelegramUpdatesOnce(
 		readonly apiBaseUrl?: string;
 		readonly fetchImpl?: typeof fetch;
 		readonly channelName?: string;
+		readonly signal?: AbortSignal;
+		readonly onError?: (error: unknown, message: InboundChannelMessage) => void;
 	},
 	context: Context,
 ): Promise<number | undefined> {
@@ -193,6 +195,7 @@ export async function pollTelegramUpdatesOnce(
 			timeout: options.timeoutSeconds ?? 25,
 			allowed_updates: ["message"],
 		}),
+		...(options.signal !== undefined ? { signal: options.signal } : {}),
 	});
 	if (!response.ok) {
 		const detail = await response.text();
@@ -207,7 +210,13 @@ export async function pollTelegramUpdatesOnce(
 		nextOffset = update.update_id + 1;
 		const inbound = parseTelegramUpdate(update, options.channelName);
 		if (inbound !== undefined) {
-			await options.gateway.ingest(inbound, context);
+			const admitted = await options.gateway.admit(inbound, context);
+			if (options.onError !== undefined) {
+				const reportError = options.onError;
+				admitted.settled.catch((err: unknown) => {
+					reportError(err, inbound);
+				});
+			}
 		}
 	}
 	return nextOffset;
