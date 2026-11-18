@@ -1,7 +1,7 @@
 // Zero-dependency Web-standard Telegram Bot adapter compatible with both Cloudflare Workers (Webhook) and Node 24 (polling/Webhook).
 
 import type { Context } from "@earendil-works/chord/context";
-import type { ChannelSendOptions, ChannelTransport, InboundChannelMessage } from "./contract.ts";
+import type { ChannelSendOptions, ChannelTransport, InboundCallbackAction, InboundChannelMessage } from "./contract.ts";
 import type { ChannelGateway } from "./gateway.ts";
 
 /** Telegram's hard per-message limit in UTF-16 code units. */
@@ -23,6 +23,21 @@ export type TelegramUpdate = {
 		};
 		readonly text?: string;
 		readonly caption?: string;
+	};
+	readonly callback_query?: {
+		readonly id: string;
+		readonly from: {
+			readonly id: number | string;
+			readonly username?: string;
+		};
+		readonly message?: {
+			readonly message_id: number | string;
+			readonly chat: {
+				readonly id: number | string;
+				readonly type: string;
+			};
+		};
+		readonly data?: string;
 	};
 };
 
@@ -95,6 +110,26 @@ export function parseTelegramUpdate(
 	};
 }
 
+/** Converts a raw Telegram `callback_query` Update into a normalized `InboundCallbackAction`, if valid. */
+export function parseTelegramCallback(
+	update: TelegramUpdate,
+	channelName: string = "telegram",
+): InboundCallbackAction | undefined {
+	const cb = update.callback_query;
+	if (cb === undefined || cb.message === undefined || cb.data === undefined || cb.data.trim().length === 0) {
+		return undefined;
+	}
+	return {
+		channel: channelName,
+		chatId: String(cb.message.chat.id),
+		senderId: String(cb.from.id),
+		callbackId: String(cb.id),
+		messageId: String(cb.message.message_id),
+		data: cb.data.trim(),
+		timestampMs: Date.now(),
+	};
+}
+
 /** Pure fetch-based Telegram Bot API outbound transport. */
 export class TelegramTransport implements ChannelTransport {
 	readonly channel: string;
@@ -108,7 +143,7 @@ export class TelegramTransport implements ChannelTransport {
 		this.#fetch = options.fetchImpl ?? globalThis.fetch;
 	}
 
-	/** Sends a text reply, automatically chunking payloads past Telegram's 4096-character limit. */
+	/** Sends a text reply, chunking payloads past Telegram's 4096-character limit and attaching inline buttons on the final chunk. */
 	async sendText(chatId: string, text: string, options?: ChannelSendOptions): Promise<void> {
 		const parts = splitTelegramText(text);
 		for (let idx = 0; idx < parts.length; idx++) {
@@ -122,6 +157,13 @@ export class TelegramTransport implements ChannelTransport {
 				if (Number.isInteger(numericReplyId)) {
 					payload.reply_parameters = { message_id: numericReplyId };
 				}
+			}
+			if (idx === parts.length - 1 && options?.buttons !== undefined && options.buttons.length > 0) {
+				payload.reply_markup = {
+					inline_keyboard: options.buttons.map((row) =>
+						row.map((btn) => ({ text: btn.label, callback_data: btn.callbackData })),
+					),
+				};
 			}
 			const response = await this.#fetch(`${this.#baseUrl}/sendMessage`, {
 				method: "POST",
@@ -141,6 +183,18 @@ export class TelegramTransport implements ChannelTransport {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ chat_id: chatId, action: "typing" }),
+		}).catch(() => undefined);
+	}
+
+	/** Answers an inline button press (`answerCallbackQuery`) to clear Telegram's loading spinner. */
+	async answerCallback(callbackId: string, text?: string): Promise<void> {
+		await this.#fetch(`${this.#baseUrl}/answerCallbackQuery`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				callback_query_id: callbackId,
+				...(text !== undefined && text.length > 0 ? { text } : {}),
+			}),
 		}).catch(() => undefined);
 	}
 }
@@ -163,6 +217,11 @@ export async function handleTelegramWebhook(
 		return new Response("Unauthorized", { status: 401 });
 	}
 	const update = (await request.json()) as TelegramUpdate;
+	const callback = parseTelegramCallback(update, options.channelName);
+	if (callback !== undefined) {
+		await options.gateway.ingestCallback(callback, context);
+		return new Response("ok", { status: 200 });
+	}
 	const inbound = parseTelegramUpdate(update, options.channelName);
 	if (inbound !== undefined) {
 		await options.gateway.ingest(inbound, context);
@@ -170,7 +229,7 @@ export async function handleTelegramWebhook(
 	return new Response("ok", { status: 200 });
 }
 
-/** Polls Telegram `getUpdates` once, admits all parsed messages into `gateway` without blocking on turn completion, and returns the next `offset`. */
+/** Polls Telegram `getUpdates` once, admits all parsed messages and callbacks without blocking on turn completion, and returns the next `offset`. */
 export async function pollTelegramUpdatesOnce(
 	options: {
 		readonly botToken: string;
@@ -193,7 +252,7 @@ export async function pollTelegramUpdatesOnce(
 		body: JSON.stringify({
 			...(options.offset !== undefined ? { offset: options.offset } : {}),
 			timeout: options.timeoutSeconds ?? 25,
-			allowed_updates: ["message"],
+			allowed_updates: ["message", "callback_query"],
 		}),
 		...(options.signal !== undefined ? { signal: options.signal } : {}),
 	});
@@ -208,6 +267,12 @@ export async function pollTelegramUpdatesOnce(
 	let nextOffset = options.offset;
 	for (const update of body.result ?? []) {
 		nextOffset = update.update_id + 1;
+		const callback = parseTelegramCallback(update, options.channelName);
+		if (callback !== undefined) {
+			const admittedCb = await options.gateway.admitCallback(callback, context);
+			admittedCb.settled.catch(() => undefined);
+			continue;
+		}
 		const inbound = parseTelegramUpdate(update, options.channelName);
 		if (inbound !== undefined) {
 			const admitted = await options.gateway.admit(inbound, context);

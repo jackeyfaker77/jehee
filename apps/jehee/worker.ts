@@ -39,6 +39,11 @@ export type JeheeWorkerEnv = {
 	readonly INSTABOX_WORKTREES_ROOT?: string;
 	readonly JEHEE_MCP_SERVERS?: string;
 	readonly JEHEE_MCP_EXPOSURE?: string;
+	readonly JEHEE_MCP_WRITE_GATE?: string;
+	readonly JEHEE_MCP_WRITE_EXEMPT?: string;
+	readonly JEHEE_QUIET_HOURS?: string;
+	readonly JEHEE_TZ_OFFSET?: string;
+	readonly JEHEE_PROACTIVE_COOLDOWN_MS?: string;
 };
 
 const RECOVERY_HEARTBEAT_MS = 60_000;
@@ -120,6 +125,7 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 				},
 				debounceMs: config.debounceMs,
 				stagingAllowedRoutes: config.stagingAllowedRoutes,
+				...(config.quietPolicy !== undefined ? { quietPolicy: config.quietPolicy } : {}),
 			});
 			if (config.telegram !== undefined) {
 				this.#gateway.registerTransport(new TelegramTransport({ botToken: config.telegram.botToken }));

@@ -1,10 +1,12 @@
 // Public entry point of @jehee/bot.
 
 export {
+	type ChannelInlineButton,
 	type ChannelRoute,
 	type ChannelSendOptions,
 	type ChannelTransport,
 	formatRouteKey,
+	type InboundCallbackAction,
 	type InboundChannelMessage,
 } from "./channels/contract.ts";
 export {
@@ -12,10 +14,12 @@ export {
 	type ChannelAllowlist,
 	ChannelGateway,
 	type ChannelGatewayOptions,
+	type GatewaySlashCommand,
 	type IngestResult,
 } from "./channels/gateway.ts";
 export {
 	handleTelegramWebhook,
+	parseTelegramCallback,
 	parseTelegramUpdate,
 	pollTelegramUpdatesOnce,
 	splitTelegramText,
@@ -36,7 +40,37 @@ export {
 	type JeheeUsageSummary,
 	type JeheeWorkshopOptions,
 	type ProactiveReplyListener,
+	type ResolveApprovalResult,
 } from "./core/host.ts";
+export {
+	ApprovalDoc,
+	type ApprovalRequestListener,
+	type ApprovalTicket,
+	type ApprovalTicketStatus,
+	checkOrCreateWriteApproval,
+	computeWriteIntentDigest,
+	DEFAULT_APPROVAL_TTL_MS,
+	matchesWriteToolPattern,
+	pruneExpiredTickets,
+	requiresWriteApproval,
+	summarizeWriteCall,
+	type WriteApprovalCheckResult,
+	type WriteApprovalPolicy,
+} from "./governance/approvals.ts";
+export {
+	formatMinuteOfDay,
+	type HeldProactiveMessage,
+	isSilentReplyText,
+	isWithinQuietHours,
+	type ProactiveGateDecision,
+	type ProactiveHoldReason,
+	ProactiveNotificationGovernor,
+	type ProactiveQuietPolicy,
+	parseQuietHoursWindow,
+	parseUtcOffsetMinutes,
+	type QuietHoursWindow,
+	SILENT_REPLY_TOKEN,
+} from "./governance/quiet-gate.ts";
 export {
 	type BlobOffloadResult,
 	type BlobRestoreResult,

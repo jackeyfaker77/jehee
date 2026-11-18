@@ -48,6 +48,7 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [ADR-0005](./adr/0005-runtime-entrypoints-and-opencode-go.md) | 双栖真机运行入口（本地 CLI / Telegram 轮询 + Cloudflare DO）与 OpenCode Go 模型装配 | Accepted | 2026-11-18 | 纯化 `JeheeHost` 跨平台内核，原生接入 `opencode-go` 模型目录，交付本地 `bin.ts`（`models`/`chat`/`telegram`）与 Cloudflare `worker.ts` + `wrangler.jsonc` 部署入口及边缘打包门禁。 |
 | [ADR-0006](./adr/0006-nonblocking-telegram-polling-and-cli-boundary.md) | Telegram 本地长轮询非阻塞两阶段入站与本地 CLI 同步边界 | Accepted | 2026-11-18 | 将 `ChannelGateway` 拆分为有序毫秒级准入 `admit` 与后台结算 `settled`，打通本地 Telegram 轮询下的连发防抖、忙时实时 `steer` 插话与 `/stop` 紧急中止，同时明确本地 CLI 保持精简同步交互。 |
 | [ADR-0007](./adr/0007-mcp-connector-skeleton-and-eval.md) | 双栖 MCP 连接器骨架、Trace 可观测性与暴露策略对比 Eval | Accepted | 2026-11-18 | 打通 `JeheeHost` 父子 Span 决策树与标准指标字典；基于 `@earendil-works/pi-mcp` 与 `tool_search` 构建双栖多实例 MCP 连接器、资源三工具与大附件句柄暂存，并落地 `eager` vs `deferred` 对比 Eval 与五类失败复盘。 |
+| [ADR-0008](./adr/0008-write-approval-and-quiet-governance.md) | 确定性写操作人工确认闭环与主动打扰静默门控（Slice 5A） | Accepted | 2026-11-18 | 基于 SQLite `ApprovalDoc` 与 SHA-256 业务参数指纹实现零阻塞单次写操作审批票据（打通 Telegram 内联按钮 `callback_query` 与 `/approve`、`/reject`），并落地静默时段、忙时让路、频控冷却与 `[SILENT]` 暂存治理。 |
 
 ### 评测结论与失败复盘记录（Evals & Postmortems）
 
@@ -94,4 +95,5 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 
 ## 4. 后续计划立项队列
 
-- **ADR-0008（Slice 5）**：确定性外发/静默门控、热插拔记忆的 Eval 驱动渐进演进，以及工坊对接外部 Coding Agent CLI 网关化。
+- **ADR-0009（Slice 5B）**：工坊对接外部成熟 Coding Agent CLI 网关化。
+- **ADR-0010（Slice 5C）**：基于 SQLite 抽屉与全文检索的热插拔持久化记忆插件及 `Eval-0002` 对比评测。

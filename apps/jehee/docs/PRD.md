@@ -2,7 +2,7 @@
 
 - **产品名称**：Jehee
 - **产品形态**：7×24 小时常驻个人伙伴型 Bot（Always-on Personal Colleague）
-- **文档状态**：Active（随各垂直切片演进同步更新，v1.1）
+- **文档状态**：Active（随各垂直切片演进同步更新，v1.2）
 - **更新日期**：2026-11-18
 
 ---
@@ -81,4 +81,6 @@
 | **Slice 3.5（已完成）** | **双栖运行入口（本地 CLI / Telegram 守护进程 + Cloudflare Workers DO）+ `opencode-go` 模型目录** | 默认接入 `opencode-go`（含 34 款模型）及多厂商注册表；一套代码同时支持本地 `.env` 直跑与 Cloudflare Free Worker 零月租部署（通过 Edge 打包门禁）。 |
 | **Slice 3.6（已完成）** | **Telegram 本地长轮询非阻塞两阶段入站（打通本地防抖、`steer` 与 `/stop`）** | 轮询器仅等待毫秒级准入（`admit`）即推进 `offset` 拉取下一批消息，实测跨批连发防抖、慢工具期间实时 `steer` 插话与 `/stop` 紧急叫停全部通过 BDD 验收；本地 CLI 保持精简同步交互。 |
 | **Slice 4（已完成）** | **双栖 MCP 连接器骨架（`tool_search` 按需暴露 + 资源三件套 + 附件句柄 + 写门控钩子）与对比 Eval** | 支持多实例 HTTP / 本地 `stdio` MCP（对接 PALE 环境）、`list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource`、乐观锁报错透传、PDF/ICS 大附件句柄无损流转，并完成 `eager` vs `deferred` 对比评测与失败复盘归档（`Eval-0001`）。 |
-| **Slice 5（规划中）** | **确定性打扰/草稿确认门控 + 热插拔记忆渐进演进与工坊外部 Coding Agent 网关化** | 后台事件支持静默归档与高风险写操作草稿确认；基于真实使用与 PALE 场景通过对比 Eval 渐进迭代轻量记忆插件（如 SQLite 历史检索 + 可读文档），并将工坊执行器演进为外部 Coding Agent 网关。 |
+| **Slice 5A（已完成）** | **确定性安全门控与主动打扰治理（SQLite 单次审批票据 + Telegram 内联按钮确认 + 三重静默暂存门控）** | 高危 MCP 写操作生成持久化 `apv_...` 确认卡片且等待期不阻塞主对话，支持 Telegram 点按钮与 `/approve` 单次防调包放行；后台推送支持静默时段、忙时让路、冷却频控与暂存汇总交付。 |
+| **Slice 5B（规划中）** | **工坊演进为外部 Coding Agent 网关** | 将工坊执行器演进为在隔离 Git Worktree 中直接驱动外部成熟 Coding Agent CLI（如 `pi` / OpenCode / Claude Code），主入口仅负责派单、中途插话与验收汇报。 |
+| **Slice 5C（规划中）** | **热插拔记忆插件渐进演进与 `Eval-0002` 对比评测** | 基于 SQLite 全文检索与可读核心抽屉实现持久化记忆插件，复用统一 Trace 指标字典对比 `StaticCore` 与新方案（`Eval-0002`）。 |

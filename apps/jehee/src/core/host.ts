@@ -25,6 +25,12 @@ import {
 	type Wake,
 } from "@earendil-works/pi-durable";
 import type { TelemetryContext } from "@earendil-works/pi-telemetry";
+import {
+	ApprovalDoc,
+	type ApprovalRequestListener,
+	type ApprovalTicket,
+	pruneExpiredTickets,
+} from "../governance/approvals.ts";
 import type { JeheeMcpOptions } from "../mcp/contract.ts";
 import { createMcpBundle } from "../mcp/extension.ts";
 import { McpConnectorHub } from "../mcp/hub.ts";
@@ -108,13 +114,28 @@ export type JeheeHistoryItem = {
 /** Listener notified when a background workshop report triggers a main-conversation reply. */
 export type ProactiveReplyListener = (replyText: string, answerEntryId: EntryId) => void | Promise<void>;
 
+/** Outcome of resolving (`approve` or `reject`) a durable write-approval ticket on `JeheeHost`. */
+export type ResolveApprovalResult =
+	| { readonly kind: "none_pending" }
+	| { readonly kind: "not_found"; readonly ticketId: string }
+	| { readonly kind: "ambiguous"; readonly pending: readonly ApprovalTicket[] }
+	| { readonly kind: "already_settled"; readonly ticket: ApprovalTicket }
+	| {
+			readonly kind: "approved";
+			readonly ticket: ApprovalTicket;
+			readonly pendingTurn?: JeheePendingTurn;
+	  }
+	| { readonly kind: "rejected"; readonly ticket: ApprovalTicket };
+
 /** Always-on personal colleague host wrapping a durable Session and its root conversation. */
 export class JeheeHost {
 	readonly #harness: Harness;
 	readonly #registry: Registry;
 	readonly #root: Conversation;
 	readonly #proactiveListeners: Set<ProactiveReplyListener>;
+	readonly #approvalListeners: Set<ApprovalRequestListener>;
 	readonly #mcpHub: McpConnectorHub | undefined;
+	readonly #now: () => number;
 	#memoryProvider: MemoryProvider | undefined;
 
 	private constructor(
@@ -123,14 +144,18 @@ export class JeheeHost {
 		root: Conversation,
 		memoryProvider: MemoryProvider | undefined,
 		proactiveListeners: Set<ProactiveReplyListener>,
+		approvalListeners: Set<ApprovalRequestListener>,
 		mcpHub: McpConnectorHub | undefined,
+		now: () => number,
 	) {
 		this.#harness = harness;
 		this.#registry = registry;
 		this.#root = root;
 		this.#memoryProvider = memoryProvider;
 		this.#proactiveListeners = proactiveListeners;
+		this.#approvalListeners = approvalListeners;
 		this.#mcpHub = mcpHub;
+		this.#now = now;
 	}
 
 	/** Opens storage, connects MCP servers, installs extensions and memory, initializes the root conversation, and resumes tasks. */
@@ -138,6 +163,8 @@ export class JeheeHost {
 		const storage: Storage = options.storage.kind === "memory" ? new MemoryStorage() : options.storage.storage;
 		const registry = createRegistry();
 		const proactiveListeners = new Set<ProactiveReplyListener>();
+		const approvalListeners = new Set<ApprovalRequestListener>();
+		const nowFn = options.now ?? Date.now;
 		for (const ext of options.extensions ?? []) {
 			registry.install(ext);
 		}
@@ -147,7 +174,18 @@ export class JeheeHost {
 		let mcpHub: McpConnectorHub | undefined;
 		if (options.mcp !== undefined) {
 			mcpHub = await McpConnectorHub.connect(options.mcp.servers);
-			const mcpBundle = createMcpBundle(mcpHub, options.mcp);
+			const callerApprovalListener = options.mcp.onApprovalRequested;
+			const mcpBundle = createMcpBundle(mcpHub, {
+				...options.mcp,
+				onApprovalRequested: async (ticket) => {
+					if (callerApprovalListener !== undefined) {
+						await callerApprovalListener(ticket);
+					}
+					for (const listener of approvalListeners) {
+						await listener(ticket);
+					}
+				},
+			});
 			for (const ext of mcpBundle.extensions) {
 				registry.install(ext);
 			}
@@ -201,7 +239,16 @@ export class JeheeHost {
 				context,
 			);
 			harness.resume();
-			return new JeheeHost(harness, registry, root, options.memory, proactiveListeners, mcpHub);
+			return new JeheeHost(
+				harness,
+				registry,
+				root,
+				options.memory,
+				proactiveListeners,
+				approvalListeners,
+				mcpHub,
+				nowFn,
+			);
 		} catch (error) {
 			await mcpHub?.close();
 			throw error;
@@ -312,6 +359,93 @@ export class JeheeHost {
 		this.#proactiveListeners.add(listener);
 		return () => {
 			this.#proactiveListeners.delete(listener);
+		};
+	}
+
+	/** Subscribes to newly created pending write-approval tickets requiring owner confirmation. */
+	onApprovalRequested(listener: ApprovalRequestListener): () => void {
+		this.#approvalListeners.add(listener);
+		return () => {
+			this.#approvalListeners.delete(listener);
+		};
+	}
+
+	/** Lists all unexpired `"pending"` write-approval tickets on the root conversation in chronological order. */
+	async listPendingApprovals(context: Context): Promise<readonly ApprovalTicket[]> {
+		const doc = await this.#harness.snapshot(ApprovalDoc, this.#root.id, context);
+		if (doc === undefined) return [];
+		const nowMs = this.#now();
+		return Object.values(doc.tickets)
+			.filter((t) => t.status === "pending" && t.expiresAtMs > nowMs)
+			.sort((a, b) => a.createdAtMs - b.createdAtMs);
+	}
+
+	/**
+	 * Approves or rejects a pending write-approval ticket in SQLite (`ApprovalDoc`).
+	 * When `decision === "approve"` and `resumeOnApprove !== false`, automatically submits an idempotent
+	 * continuation turn so the model executes the approved tool call immediately.
+	 */
+	async resolveApproval(
+		input: {
+			readonly ticketId?: string;
+			readonly decision: "approve" | "reject";
+			readonly resumeOnApprove?: boolean;
+		},
+		context: Context,
+	): Promise<ResolveApprovalResult> {
+		const explicitId = input.ticketId?.trim();
+		const txOutcome = await this.#root.commit(async (tx) => {
+			const nowMs = this.#now();
+			const doc = await tx.doc(ApprovalDoc, this.#root.id);
+			pruneExpiredTickets(doc.tickets, nowMs);
+
+			let target: ApprovalTicket | undefined;
+			if (explicitId !== undefined && explicitId.length > 0) {
+				target = Object.hasOwn(doc.tickets, explicitId) ? doc.tickets[explicitId] : undefined;
+				if (target === undefined) {
+					return { kind: "not_found", ticketId: explicitId } as const;
+				}
+			} else {
+				const pending = Object.values(doc.tickets)
+					.filter((t) => t.status === "pending")
+					.sort((a, b) => a.createdAtMs - b.createdAtMs);
+				if (pending.length === 0) {
+					return { kind: "none_pending" } as const;
+				}
+				if (pending.length > 1) {
+					return { kind: "ambiguous", pending: pending.map((t) => ({ ...t })) } as const;
+				}
+				target = pending[0]!;
+			}
+
+			if (target.status !== "pending") {
+				return { kind: "already_settled", ticket: { ...target } } as const;
+			}
+
+			target.status = input.decision === "approve" ? "approved" : "rejected";
+			return {
+				kind: input.decision === "approve" ? ("approved" as const) : ("rejected" as const),
+				ticket: { ...target },
+			};
+		}, context);
+
+		if (txOutcome.kind !== "approved") {
+			return txOutcome;
+		}
+		if (input.resumeOnApprove === false) {
+			return { kind: "approved", ticket: txOutcome.ticket };
+		}
+		const pendingTurn = await this.submitMessage(
+			{
+				text: `[Owner Approval Granted] Ticket ${txOutcome.ticket.id} (${txOutcome.ticket.server}/${txOutcome.ticket.tool}) has been approved by the owner. Execute this action now and report the result concisely.`,
+				requestId: `approval-resume:${txOutcome.ticket.id}`,
+			},
+			context,
+		);
+		return {
+			kind: "approved",
+			ticket: txOutcome.ticket,
+			pendingTurn,
 		};
 	}
 

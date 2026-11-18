@@ -1,6 +1,7 @@
 // Portable contracts for Jehee's MCP connector layer (Web/Edge safe: zero Node child_process dependencies).
 
 import type { CallToolResult, McpFetch, McpTransport, Resource, ResourceTemplate, Tool } from "@earendil-works/pi-mcp";
+import type { ApprovalRequestListener, WriteApprovalPolicy } from "../governance/approvals.ts";
 
 /** Strategy governing how MCP business tools are exposed to the root conversation. */
 export type JeheeMcpExposure = "deferred" | "eager";
@@ -45,6 +46,10 @@ export type JeheeMcpOptions = {
 	readonly exposure?: JeheeMcpExposure;
 	/** Decoded byte threshold above which binary Base64 payloads are replaced with `$jehee_blob:<id>` handles. Defaults to 4096. */
 	readonly blobOffloadThresholdBytes?: number;
+	/** Declarative durable write-approval policy backed by SQLite `ApprovalDoc`. Defaults to `{ mode: "off" }`. */
+	readonly writeGate?: WriteApprovalPolicy;
+	/** Listener notified when `writeGate` creates a new pending approval ticket. */
+	readonly onApprovalRequested?: ApprovalRequestListener;
 	/** Optional deterministic gate invoked before non-readOnly MCP tools execute. */
 	readonly beforeWriteToolCall?: (call: McpWriteCallInfo) => McpWriteGateDecision | Promise<McpWriteGateDecision>;
 };

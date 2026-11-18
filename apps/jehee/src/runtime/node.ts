@@ -104,7 +104,10 @@ export async function loadNodeMcpOptions(options: {
 		}
 	}
 
-	return mergeJeheeMcpOptions(fileMcp, config.mcp, config.mcpExposure);
+	const mergedMcp = mergeJeheeMcpOptions(fileMcp, config.mcp, config.mcpExposure);
+	return mergedMcp !== undefined && config.writeGate !== undefined
+		? { ...mergedMcp, writeGate: config.writeGate }
+		: mergedMcp;
 }
 
 /** Assembles a complete Node runtime (`JeheeHost` + optional `ChannelGateway` + MCP + InstaBox Workshop) from `env`. */
@@ -169,6 +172,7 @@ export async function assembleNodeRuntime(
 		},
 		debounceMs: config.debounceMs,
 		stagingAllowedRoutes: config.stagingAllowedRoutes,
+		...(config.quietPolicy !== undefined ? { quietPolicy: config.quietPolicy } : {}),
 	});
 
 	if (config.telegram !== undefined) {

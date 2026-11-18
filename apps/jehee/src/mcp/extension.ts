@@ -22,6 +22,7 @@ import {
 	toLlmContent,
 } from "@earendil-works/pi-mcp";
 import { obj, opt, str } from "@earendil-works/pi-schema";
+import { checkOrCreateWriteApproval } from "../governance/approvals.ts";
 import { startJeheeMcpSpan } from "../telemetry/recorder.ts";
 import { DEFAULT_BLOB_OFFLOAD_THRESHOLD_BYTES, McpBlobVault } from "./blob-vault.ts";
 import type { ConnectedMcpServer, JeheeMcpExposure, JeheeMcpOptions } from "./contract.ts";
@@ -298,9 +299,21 @@ function createBusinessToolRegistration(params: {
 	readonly exposure: JeheeMcpExposure;
 	readonly thresholdBytes: number;
 	readonly blobVault: McpBlobVault;
+	readonly writeGate: JeheeMcpOptions["writeGate"];
+	readonly onApprovalRequested: JeheeMcpOptions["onApprovalRequested"];
 	readonly beforeWriteToolCall: JeheeMcpOptions["beforeWriteToolCall"];
 }): ToolRegistration {
-	const { server, rawTool, registeredName, exposure, thresholdBytes, blobVault, beforeWriteToolCall } = params;
+	const {
+		server,
+		rawTool,
+		registeredName,
+		exposure,
+		thresholdBytes,
+		blobVault,
+		writeGate,
+		onApprovalRequested,
+		beforeWriteToolCall,
+	} = params;
 	const isReadOnly = rawTool.annotations?.readOnlyHint === true;
 	const title = rawTool.title ?? rawTool.annotations?.title;
 	const baseDescription = rawTool.description?.trim() || title || `MCP tool ${rawTool.name} on server ${server.name}`;
@@ -312,7 +325,7 @@ function createBusinessToolRegistration(params: {
 		...(exposure === "deferred" ? { deferred: true } : {}),
 		replay: isReadOnly ? "safe" : "unsafe",
 		...(rawTool.outputSchema !== undefined ? { structuredOutputSchema: rawTool.outputSchema } : {}),
-		execute: async (args, _api, context): Promise<ToolExecutionResult> => {
+		execute: async (args, api, context): Promise<ToolExecutionResult> => {
 			return startJeheeMcpSpan(context.telemetry)(
 				"jehee.mcp.call",
 				{
@@ -355,6 +368,56 @@ function createBusinessToolRegistration(params: {
 									},
 								],
 								details: { server: server.name, tool: rawTool.name, blockedByGate: true },
+							};
+						}
+						span.setAttributes({ "gate.action": "allow" });
+					}
+
+					if (!isReadOnly && writeGate !== undefined && writeGate.mode === "confirm-writes") {
+						const approvalCheck = await checkOrCreateWriteApproval({
+							api,
+							context,
+							policy: writeGate,
+							server: server.name,
+							tool: rawTool.name,
+							args: expandedArgs,
+							rawArgsForSummary: rawArgs,
+						});
+						if (approvalCheck.action === "block") {
+							if (approvalCheck.isNewTicket && onApprovalRequested !== undefined) {
+								await onApprovalRequested(approvalCheck.ticket);
+							}
+							const reason = `Owner confirmation required (ticket ${approvalCheck.ticket.id}). Inform the owner and wait for approval; do not retry until approved.`;
+							span.setAttributes({
+								"gate.action": "block",
+								"mcp.status": "confirmation_required",
+								is_error: true,
+								"blob.restored_count": restoredCount,
+							});
+							span.setStatus({
+								status: "error",
+								error: { name: "write_gate_blocked", message: reason },
+							});
+							return {
+								isError: true,
+								output: [
+									{
+										type: "text",
+										text: JSON.stringify({
+											status: "confirmation_required",
+											approval_id: approvalCheck.ticket.id,
+											server: server.name,
+											tool: rawTool.name,
+											reason,
+										}),
+									},
+								],
+								details: {
+									server: server.name,
+									tool: rawTool.name,
+									blockedByGate: true,
+									approvalId: approvalCheck.ticket.id,
+								},
 							};
 						}
 						span.setAttributes({ "gate.action": "allow" });
@@ -437,6 +500,8 @@ export function createMcpBundle(hub: McpConnectorHub, options?: Omit<JeheeMcpOpt
 					exposure,
 					thresholdBytes,
 					blobVault,
+					writeGate: options?.writeGate,
+					onApprovalRequested: options?.onApprovalRequested,
 					beforeWriteToolCall: options?.beforeWriteToolCall,
 				}),
 			);
