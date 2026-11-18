@@ -66,7 +66,7 @@ type ReporterState = { phase: "deliver" } | { phase: "report"; report?: string }
 export type WorkshopBundleOptions = {
 	readonly client: InstaBoxClient;
 	readonly provisioner: WorkshopProvisioner;
-	readonly onProactiveReply?: (replyText: string) => void | Promise<void>;
+	readonly onProactiveReply?: (replyText: string, answerEntryId: EntryId) => void | Promise<void>;
 };
 
 /** Both extensions installed into the Harness registry (sandbox tools stay off the root conversation). */
@@ -139,7 +139,7 @@ export function createWorkshopBundle(options: WorkshopBundleOptions): WorkshopBu
 						const msg = ansEntry?.model?.[0];
 						const mainReplyText = msg?.role === "assistant" ? extractAssistantText(msg) : "";
 						if (mainReplyText.trim().length > 0) {
-							await options.onProactiveReply(mainReplyText);
+							await options.onProactiveReply(mainReplyText, mainSettled.answer);
 						}
 					}
 				}

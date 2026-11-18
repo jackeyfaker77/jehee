@@ -70,8 +70,11 @@ export class ChannelGateway {
 			options.stagingAllowedRoutes !== undefined && options.stagingAllowedRoutes.length > 0
 				? new Set(options.stagingAllowedRoutes)
 				: undefined;
-		this.#unsubscribeProactive = this.#host.onProactiveReply(async (replyText) => {
+		this.#unsubscribeProactive = this.#host.onProactiveReply(async (replyText, answerEntryId) => {
+			const numericAnswerId = Number(answerEntryId);
+			if (this.#deliveredAnswerIds.has(numericAnswerId)) return;
 			if (this.#lastActiveRoute !== undefined) {
+				this.#deliveredAnswerIds.add(numericAnswerId);
 				await this.pushMessage(this.#lastActiveRoute, replyText);
 			}
 		});

@@ -2,8 +2,13 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createModels } from "@earendil-works/pi-ai/models";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import {
+	ChannelGateway,
 	InstaBoxClient,
+	JeheeHost,
 	resolveScopedSandboxPath,
 	SingleBoxWorktreeProvisioner,
 	validateTaskSlug,
@@ -89,5 +94,102 @@ describe("workshop sandbox safety and client", () => {
 			"GET /v1/machines/m_real123",
 			"POST /v1/machines/m_real123/exec",
 		]);
+	});
+
+	it("deduplicates proactive outbound pushes when multiple workshop reporters coalesce onto one main answer", async () => {
+		const faux = fauxProvider();
+		// Step 1 (main): spawn w1 and w2 in one turn -> creates two WorkshopReporter tasks
+		// Step 2 & 3 (subagents w1 & w2): each finishes immediately
+		// Step 4 (main): replies to user's initial spawn turn while both reporters queue followUp on main
+		// Step 5 (main): single coalesced followUp answer covering both w1 and w2 reports
+		let subTurn = 0;
+		faux.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("workshop", { action: "spawn", name: "w1", message: "job 1" }),
+					fauxToolCall("workshop", { action: "spawn", name: "w2", message: "job 2" }),
+				],
+				{ stopReason: "toolUse" },
+			),
+			(ctx) => {
+				const sys = JSON.stringify(ctx.messages[0] ?? "");
+				if (sys.includes("Workshop subagent")) {
+					subTurn += 1;
+					return fauxAssistantMessage(`subagent-done-${subTurn}`);
+				}
+				return fauxAssistantMessage("两个工坊任务均已启动。");
+			},
+			(ctx) => {
+				const sys = JSON.stringify(ctx.messages[0] ?? "");
+				if (sys.includes("Workshop subagent")) {
+					subTurn += 1;
+					return fauxAssistantMessage(`subagent-done-${subTurn}`);
+				}
+				return fauxAssistantMessage("两个工坊任务均已启动。");
+			},
+			fauxAssistantMessage("两个工坊任务均已启动。"),
+			fauxAssistantMessage("汇总汇报：w1 与 w2 均已完成。"),
+		]);
+
+		const models = createModels();
+		models.setProvider(faux.provider);
+
+		const client = new InstaBoxClient({
+			apiKey: "ibk_unit",
+			fetchImpl: async () =>
+				Response.json({
+					id: "m_1",
+					state: "running",
+					stdout: "",
+					stderr: "",
+					exitCode: 0,
+					timedOut: false,
+					truncated: false,
+				}),
+		});
+		const provisioner = new SingleBoxWorktreeProvisioner({ client, machineId: "m_1" });
+		const host = await JeheeHost.open(
+			{
+				storage: { kind: "memory" },
+				models,
+				defaultModel: { provider: "faux", modelId: faux.getModel().id },
+				workshop: { client, provisioner },
+			},
+			BACKGROUND_CONTEXT,
+		);
+		const pushed: string[] = [];
+		const gateway = new ChannelGateway({
+			host,
+			allowFrom: { telegram: ["owner-1"] },
+		});
+		gateway.registerTransport({
+			channel: "telegram",
+			sendText: async (_chatId, text) => {
+				pushed.push(text);
+			},
+		});
+
+		try {
+			await gateway.ingest(
+				{
+					channel: "telegram",
+					chatId: "chat-1",
+					senderId: "owner-1",
+					messageId: "1",
+					text: "同时开 w1 和 w2 两个工坊",
+					timestampMs: Date.now(),
+				},
+				BACKGROUND_CONTEXT,
+			);
+			await host.waitForWorkshopSettled(BACKGROUND_CONTEXT);
+			await gateway.drain();
+
+			const summaryCount = pushed.filter((msg) => msg === "汇总汇报：w1 与 w2 均已完成。").length;
+			assert.equal(summaryCount, 1, `Expected proactive summary once, got: ${JSON.stringify(pushed)}`);
+		} finally {
+			gateway.dispose();
+			await host.close(BACKGROUND_CONTEXT);
+			await gateway.drain();
+		}
 	});
 });

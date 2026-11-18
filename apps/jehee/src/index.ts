@@ -34,6 +34,7 @@ export {
 	type JeheeStorageConfig,
 	type JeheeTurnReply,
 	type JeheeWorkshopOptions,
+	type ProactiveReplyListener,
 } from "./core/host.ts";
 export { createMemoryExtension, JEHEE_MEMORY_EXTENSION_NAME } from "./memory/bridge.ts";
 export {

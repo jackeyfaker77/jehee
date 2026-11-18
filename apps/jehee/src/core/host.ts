@@ -87,12 +87,15 @@ export type JeheeHistoryItem = {
 	readonly text: string;
 };
 
+/** Listener notified when a background workshop report triggers a main-conversation reply. */
+export type ProactiveReplyListener = (replyText: string, answerEntryId: EntryId) => void | Promise<void>;
+
 /** Always-on personal colleague host wrapping a durable Session and its root conversation. */
 export class JeheeHost {
 	readonly #harness: Harness;
 	readonly #registry: Registry;
 	readonly #root: Conversation;
-	readonly #proactiveListeners: Set<(replyText: string) => void | Promise<void>>;
+	readonly #proactiveListeners: Set<ProactiveReplyListener>;
 	#memoryProvider: MemoryProvider | undefined;
 
 	private constructor(
@@ -100,7 +103,7 @@ export class JeheeHost {
 		registry: Registry,
 		root: Conversation,
 		memoryProvider: MemoryProvider | undefined,
-		proactiveListeners: Set<(replyText: string) => void | Promise<void>>,
+		proactiveListeners: Set<ProactiveReplyListener>,
 	) {
 		this.#harness = harness;
 		this.#registry = registry;
@@ -113,7 +116,7 @@ export class JeheeHost {
 	static async open(options: JeheeHostOptions, context: Context): Promise<JeheeHost> {
 		const storage: Storage = options.storage.kind === "memory" ? new MemoryStorage() : options.storage.storage;
 		const registry = createRegistry();
-		const proactiveListeners = new Set<(replyText: string) => void | Promise<void>>();
+		const proactiveListeners = new Set<ProactiveReplyListener>();
 		for (const ext of options.extensions ?? []) {
 			registry.install(ext);
 		}
@@ -125,9 +128,9 @@ export class JeheeHost {
 			workshopBundle = createWorkshopBundle({
 				client: options.workshop.client,
 				provisioner: options.workshop.provisioner,
-				onProactiveReply: async (replyText) => {
+				onProactiveReply: async (replyText, answerEntryId) => {
 					for (const listener of proactiveListeners) {
-						await listener(replyText);
+						await listener(replyText, answerEntryId);
 					}
 				},
 			});
@@ -265,7 +268,7 @@ export class JeheeHost {
 	}
 
 	/** Subscribes to unsolicited main-agent replies produced after background workshop reports arrive. */
-	onProactiveReply(listener: (replyText: string) => void | Promise<void>): () => void {
+	onProactiveReply(listener: ProactiveReplyListener): () => void {
 		this.#proactiveListeners.add(listener);
 		return () => {
 			this.#proactiveListeners.delete(listener);
