@@ -2,7 +2,7 @@
 
 - **产品名称**：Jehee
 - **产品形态**：7×24 小时常驻个人伙伴型 Bot（Always-on Personal Colleague）
-- **文档状态**：Active（随各垂直切片演进同步更新，v1.2）
+- **文档状态**：Active（随各垂直切片演进同步更新，v1.3）
 - **更新日期**：2026-11-18
 
 ---
@@ -41,7 +41,7 @@
 - **个人助理主定位（总管 + 连接器 + 外部 Coding Agent 网关）**：
   - Jehee 聚焦于代表用户跨时间、跨日常应用（邮件、日历、账单、出行、健康等，对齐 PALE 场景）协调事务，**不重复造轮子替代专业 Coding Agent**；
   - **MCP 连接器骨架**：原生支持双栖连接外部 MCP 服务（云端控制面走 HTTP MCP，本地与 PALE 评测走 `stdio` MCP），默认采用“服务摘要常驻 + `tool_search` 按需加载工具 Schema”，并支持跨应用附件资源读取与大二进制句柄无损传递（防上下文爆窗）；
-  - **工坊网关（InstaBox 云电脑与多 Worktree 隔离）**：保留控制面（Node SQLite / Cloudflare Workers Free DO）与云执行面（InstaBox 4C8G，`/data/jehee/worktrees/<task-id>`）分离架构；重型工程任务在独立目录异步执行并回推精简结论，后续可平滑切换为直接调度外部成熟 Coding Agent CLI（如 `pi` / OpenCode / Claude Code / Codex）。
+  - **工坊网关（双执行面 Git Worktree 隔离 + 外部 Coding Agent 调度）**：同时支持云执行面（InstaBox 4C8G，`/data/jehee/worktrees/<task-id>`）与本机执行面（`LocalWorktreeBackend` 本地 `git worktree` 隔离）；通过回合制 `--print`/`--continue` 驱动与后台 PID 轮询直接调度外部成熟 Coding Agent CLI（内置 `pi`、`opencode`、`antigravity` (`agy`)、`claude`、`codex`、`custom` 及 `builtin` 兜底），在独立分支异步执行并附带确定性 `git diff --stat` 验收回推精简结论。
 - **受控上下文共享（防噪音污染）**：
   - 工坊子 Agent **只读取基础记忆切片（如用户长期编码偏好、项目规范）与当前任务契约（Task Brief）**；
   - **绝不继承**主聊天窗口里的日常闲聊记录，工坊内部产生的几万行命令输出也**绝不倒灌**回主聊天窗口。
@@ -82,5 +82,5 @@
 | **Slice 3.6（已完成）** | **Telegram 本地长轮询非阻塞两阶段入站（打通本地防抖、`steer` 与 `/stop`）** | 轮询器仅等待毫秒级准入（`admit`）即推进 `offset` 拉取下一批消息，实测跨批连发防抖、慢工具期间实时 `steer` 插话与 `/stop` 紧急叫停全部通过 BDD 验收；本地 CLI 保持精简同步交互。 |
 | **Slice 4（已完成）** | **双栖 MCP 连接器骨架（`tool_search` 按需暴露 + 资源三件套 + 附件句柄 + 写门控钩子）与对比 Eval** | 支持多实例 HTTP / 本地 `stdio` MCP（对接 PALE 环境）、`list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource`、乐观锁报错透传、PDF/ICS 大附件句柄无损流转，并完成 `eager` vs `deferred` 对比评测与失败复盘归档（`Eval-0001`）。 |
 | **Slice 5A（已完成）** | **确定性安全门控与主动打扰治理（SQLite 单次审批票据 + Telegram 内联按钮确认 + 三重静默暂存门控）** | 高危 MCP 写操作生成持久化 `apv_...` 确认卡片且等待期不阻塞主对话，支持 Telegram 点按钮与 `/approve` 单次防调包放行；后台推送支持静默时段、忙时让路、冷却频控与暂存汇总交付。 |
-| **Slice 5B（规划中）** | **工坊演进为外部 Coding Agent 网关** | 将工坊执行器演进为在隔离 Git Worktree 中直接驱动外部成熟 Coding Agent CLI（如 `pi` / OpenCode / Claude Code），主入口仅负责派单、中途插话与验收汇报。 |
+| **Slice 5B（已完成）** | **工坊演进为双执行面外部 Coding Agent 网关（`pi` / `opencode` / `antigravity` / `claude` / `codex`）** | 支持云端 InstaBox 与本机双 Git Worktree 隔离，通过回合制 `--print`/`--continue` 与后台 PID 轮询调度异构外部 Coding Agent CLI，并附带确定性 `git diff --stat` 验收回执。 |
 | **Slice 5C（规划中）** | **热插拔记忆插件渐进演进与 `Eval-0002` 对比评测** | 基于 SQLite 全文检索与可读核心抽屉实现持久化记忆插件，复用统一 Trace 指标字典对比 `StaticCore` 与新方案（`Eval-0002`）。 |

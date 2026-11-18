@@ -36,6 +36,8 @@ import { createMcpBundle } from "../mcp/extension.ts";
 import { McpConnectorHub } from "../mcp/hub.ts";
 import { createMemoryExtension } from "../memory/bridge.ts";
 import { extractAssistantText, extractUserText, type MemoryProvider } from "../memory/contract.ts";
+import type { WorkshopExecutionBackend } from "../workshop/backend.ts";
+import type { CustomCodingAgentTemplate, WorkshopDriverName } from "../workshop/coding-agent-driver.ts";
 import { createWorkshopBundle, type WorkshopBundle, WorkshopRegistryDoc } from "../workshop/extension.ts";
 import type { InstaBoxClient } from "../workshop/instabox-client.ts";
 import type { WorkshopProvisioner } from "../workshop/provisioner.ts";
@@ -43,10 +45,15 @@ import type { WorkshopProvisioner } from "../workshop/provisioner.ts";
 /** Portable storage backend configuration for JeheeHost. */
 export type JeheeStorageConfig = { readonly kind: "memory" } | { readonly kind: "custom"; readonly storage: Storage };
 
-/** Optional cloud workshop configuration attached to JeheeHost. */
+/** Optional cloud or local Workshop configuration attached to JeheeHost. */
 export type JeheeWorkshopOptions = {
-	readonly client: InstaBoxClient;
-	readonly provisioner: WorkshopProvisioner;
+	readonly backend?: WorkshopExecutionBackend;
+	readonly client?: InstaBoxClient;
+	readonly provisioner?: WorkshopProvisioner;
+	readonly defaultDriver?: WorkshopDriverName;
+	readonly agentModel?: string;
+	readonly customTemplate?: CustomCodingAgentTemplate;
+	readonly pollIntervalMs?: number;
 };
 
 /** Construction options for opening a JeheeHost instance. */
@@ -136,13 +143,13 @@ export class JeheeHost {
 	readonly #approvalListeners: Set<ApprovalRequestListener>;
 	readonly #mcpHub: McpConnectorHub | undefined;
 	readonly #now: () => number;
-	#memoryProvider: MemoryProvider | undefined;
+	readonly #memoryHolder: { current: MemoryProvider | undefined };
 
 	private constructor(
 		harness: Harness,
 		registry: Registry,
 		root: Conversation,
-		memoryProvider: MemoryProvider | undefined,
+		memoryHolder: { current: MemoryProvider | undefined },
 		proactiveListeners: Set<ProactiveReplyListener>,
 		approvalListeners: Set<ApprovalRequestListener>,
 		mcpHub: McpConnectorHub | undefined,
@@ -151,7 +158,7 @@ export class JeheeHost {
 		this.#harness = harness;
 		this.#registry = registry;
 		this.#root = root;
-		this.#memoryProvider = memoryProvider;
+		this.#memoryHolder = memoryHolder;
 		this.#proactiveListeners = proactiveListeners;
 		this.#approvalListeners = approvalListeners;
 		this.#mcpHub = mcpHub;
@@ -190,11 +197,22 @@ export class JeheeHost {
 				registry.install(ext);
 			}
 		}
+		const memoryHolder: { current: MemoryProvider | undefined } = { current: options.memory };
 		let workshopBundle: WorkshopBundle | undefined;
 		if (options.workshop !== undefined) {
 			workshopBundle = createWorkshopBundle({
-				client: options.workshop.client,
-				provisioner: options.workshop.provisioner,
+				...(options.workshop.backend !== undefined ? { backend: options.workshop.backend } : {}),
+				...(options.workshop.client !== undefined ? { client: options.workshop.client } : {}),
+				...(options.workshop.provisioner !== undefined ? { provisioner: options.workshop.provisioner } : {}),
+				...(options.workshop.defaultDriver !== undefined ? { defaultDriver: options.workshop.defaultDriver } : {}),
+				...(options.workshop.agentModel !== undefined ? { agentModel: options.workshop.agentModel } : {}),
+				...(options.workshop.customTemplate !== undefined
+					? { customTemplate: options.workshop.customTemplate }
+					: {}),
+				...(options.workshop.pollIntervalMs !== undefined
+					? { pollIntervalMs: options.workshop.pollIntervalMs }
+					: {}),
+				getCorePrompt: (convId) => memoryHolder.current?.renderCorePrompt?.(convId),
 				onProactiveReply: async (replyText, answerEntryId) => {
 					for (const listener of proactiveListeners) {
 						await listener(replyText, answerEntryId);
@@ -202,7 +220,9 @@ export class JeheeHost {
 				},
 			});
 			registry.install(workshopBundle.orchestratorExtension);
-			registry.install(workshopBundle.sandboxExtension);
+			if (workshopBundle.sandboxExtension !== undefined) {
+				registry.install(workshopBundle.sandboxExtension);
+			}
 		}
 		try {
 			const harness = await Harness.open(
@@ -221,12 +241,14 @@ export class JeheeHost {
 				},
 				context,
 			);
+			const removedOnRoot =
+				workshopBundle?.sandboxExtension !== undefined ? [workshopBundle.sandboxExtension] : undefined;
 			const root = await harness.root(context, {
 				agent: {
 					model: options.defaultModel,
 					instructions: options.instructions,
 					cwd: options.cwd,
-					...(workshopBundle !== undefined ? { extensions: { remove: [workshopBundle.sandboxExtension] } } : {}),
+					...(removedOnRoot !== undefined ? { extensions: { remove: removedOnRoot } } : {}),
 				},
 			});
 			await root.configure(
@@ -234,7 +256,7 @@ export class JeheeHost {
 					model: options.defaultModel,
 					...(options.instructions !== undefined ? { instructions: options.instructions } : {}),
 					...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
-					...(workshopBundle !== undefined ? { extensions: { remove: [workshopBundle.sandboxExtension] } } : {}),
+					...(removedOnRoot !== undefined ? { extensions: { remove: removedOnRoot } } : {}),
 				},
 				context,
 			);
@@ -243,7 +265,7 @@ export class JeheeHost {
 				harness,
 				registry,
 				root,
-				options.memory,
+				memoryHolder,
 				proactiveListeners,
 				approvalListeners,
 				mcpHub,
@@ -262,7 +284,7 @@ export class JeheeHost {
 
 	/** Currently mounted memory provider, if any. */
 	get memoryProvider(): MemoryProvider | undefined {
-		return this.#memoryProvider;
+		return this.#memoryHolder.current;
 	}
 
 	/** Configured names of currently connected MCP servers (empty when no MCP servers are mounted). */
@@ -282,7 +304,7 @@ export class JeheeHost {
 
 	/** Hot-swaps the active MemoryProvider in place without dropping conversation history or restarting the host. */
 	setMemoryProvider(provider: MemoryProvider): void {
-		this.#memoryProvider = provider;
+		this.#memoryHolder.current = provider;
 		this.#registry.install(createMemoryExtension(provider));
 	}
 

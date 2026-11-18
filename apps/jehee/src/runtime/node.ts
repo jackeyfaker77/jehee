@@ -13,7 +13,9 @@ import { mergeJeheeMcpOptions, type ParsedStdioServerInput, parseMcpConfigJson }
 import type { JeheeMcpOptions } from "../mcp/contract.ts";
 import { stdioMcpServer } from "../mcp/node-stdio.ts";
 import { StaticCoreMemoryProvider } from "../memory/static-core.ts";
+import { InstaBoxWorkshopBackend } from "../workshop/backend.ts";
 import { InstaBoxClient } from "../workshop/instabox-client.ts";
+import { LocalWorktreeBackend } from "../workshop/node-local-backend.ts";
 import { SingleBoxWorktreeProvisioner } from "../workshop/provisioner.ts";
 import { parseJeheeEnvConfig } from "./config.ts";
 import { createJeheeModels, type EnvDictionary } from "./models.ts";
@@ -133,6 +135,12 @@ export async function assembleNodeRuntime(
 	const models = createJeheeModels(options.env);
 	const memory = new StaticCoreMemoryProvider({ corePrompt: config.coreMemoryPrompt });
 
+	const sharedWorkshopOpts = {
+		...(config.workshopDriver !== undefined ? { defaultDriver: config.workshopDriver } : {}),
+		...(config.workshopAgentModel !== undefined ? { agentModel: config.workshopAgentModel } : {}),
+		...(config.workshopCustomTemplate !== undefined ? { customTemplate: config.workshopCustomTemplate } : {}),
+	};
+
 	const workshop =
 		config.instabox !== undefined
 			? (() => {
@@ -147,9 +155,25 @@ export async function assembleNodeRuntime(
 							? { worktreesRoot: config.instabox.worktreesRoot }
 							: {}),
 					});
-					return { client, provisioner };
+					const backend = new InstaBoxWorkshopBackend({
+						client,
+						provisioner,
+						...(config.workshopDefaultRepo !== undefined ? { defaultRepoPath: config.workshopDefaultRepo } : {}),
+					});
+					return { backend, client, provisioner, ...sharedWorkshopOpts };
 				})()
-			: undefined;
+			: config.localWorkshop !== undefined
+				? {
+						backend: new LocalWorktreeBackend({
+							worktreesRoot: config.localWorkshop.worktreesRoot,
+							...(config.localWorkshop.defaultRepoPath !== undefined
+								? { defaultRepoPath: config.localWorkshop.defaultRepoPath }
+								: {}),
+							env: options.env,
+						}),
+						...sharedWorkshopOpts,
+					}
+				: undefined;
 
 	const host = await openNodeJeheeHost(
 		{

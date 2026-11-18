@@ -56,7 +56,11 @@ export async function inspectWorkerBundle(): Promise<WorkerBundleReport> {
 	}
 	for (const inputPath of Object.keys(result.metafile.inputs)) {
 		const normalized = inputPath.replaceAll("\\", "/");
-		if (normalized.includes("src/runtime/node.ts") || normalized.includes("src/mcp/node-stdio.ts")) {
+		if (
+			normalized.includes("src/runtime/node.ts") ||
+			normalized.includes("src/mcp/node-stdio.ts") ||
+			normalized.includes("src/workshop/node-local-backend.ts")
+		) {
 			throw new Error(`Cloudflare worker bundle must not pull in Node-only module "${inputPath}"`);
 		}
 	}

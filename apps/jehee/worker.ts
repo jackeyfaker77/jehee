@@ -12,6 +12,7 @@ import { JeheeHost } from "./src/core/host.ts";
 import { StaticCoreMemoryProvider } from "./src/memory/static-core.ts";
 import { parseJeheeEnvConfig } from "./src/runtime/config.ts";
 import { createJeheeModels, type EnvDictionary } from "./src/runtime/models.ts";
+import { InstaBoxWorkshopBackend } from "./src/workshop/backend.ts";
 import { InstaBoxClient } from "./src/workshop/instabox-client.ts";
 import { SingleBoxWorktreeProvisioner } from "./src/workshop/provisioner.ts";
 
@@ -37,6 +38,10 @@ export type JeheeWorkerEnv = {
 	readonly INSTABOX_MACHINE_ID?: string;
 	readonly INSTABOX_BASE_URL?: string;
 	readonly INSTABOX_WORKTREES_ROOT?: string;
+	readonly JEHEE_WORKSHOP_DRIVER?: string;
+	readonly JEHEE_WORKSHOP_AGENT_MODEL?: string;
+	readonly JEHEE_WORKSHOP_DEFAULT_REPO?: string;
+	readonly JEHEE_WORKSHOP_CUSTOM_ARGV?: string;
 	readonly JEHEE_MCP_SERVERS?: string;
 	readonly JEHEE_MCP_EXPOSURE?: string;
 	readonly JEHEE_MCP_WRITE_GATE?: string;
@@ -97,7 +102,23 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 									? { worktreesRoot: config.instabox.worktreesRoot }
 									: {}),
 							});
-							return { client, provisioner };
+							const backend = new InstaBoxWorkshopBackend({
+								client,
+								provisioner,
+								...(config.workshopDefaultRepo !== undefined
+									? { defaultRepoPath: config.workshopDefaultRepo }
+									: {}),
+							});
+							return {
+								backend,
+								client,
+								provisioner,
+								...(config.workshopDriver !== undefined ? { defaultDriver: config.workshopDriver } : {}),
+								...(config.workshopAgentModel !== undefined ? { agentModel: config.workshopAgentModel } : {}),
+								...(config.workshopCustomTemplate !== undefined
+									? { customTemplate: config.workshopCustomTemplate }
+									: {}),
+							};
 						})()
 					: undefined;
 

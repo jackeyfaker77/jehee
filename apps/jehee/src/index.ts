@@ -135,7 +135,31 @@ export {
 	startJeheeMcpSpan,
 } from "./telemetry/recorder.ts";
 export {
+	buildGitSummaryBlock,
+	filterGitStatusShortLines,
+	InstaBoxWorkshopBackend,
+	type StartedWorkshopJob,
+	type StartWorkshopJobRequest,
+	WORKSHOP_META_DIR,
+	type WorkshopExecutionBackend,
+	type WorkshopJobPollResult,
+} from "./workshop/backend.ts";
+export {
+	ALL_WORKSHOP_DRIVER_NAMES,
+	buildCodingAgentArgv,
+	type CodingAgentInvocationInput,
+	type CustomCodingAgentTemplate,
+	composeWorkshopPrompt,
+	type ExternalWorkshopDriverName,
+	formatWorkshopCompletionReport,
+	MAX_WORKSHOP_REPORT_CHARS,
+	parseWorkshopDriverName,
+	truncateWorkshopAgentOutput,
+	type WorkshopDriverName,
+} from "./workshop/coding-agent-driver.ts";
+export {
 	createWorkshopBundle,
+	DEFAULT_WORKSHOP_POLL_INTERVAL_MS,
 	type WorkshopBundle,
 	type WorkshopBundleOptions,
 	WorkshopRegistryDoc,

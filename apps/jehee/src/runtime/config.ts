@@ -5,6 +5,11 @@ import type { WriteApprovalPolicy } from "../governance/approvals.ts";
 import { type ProactiveQuietPolicy, parseQuietHoursWindow } from "../governance/quiet-gate.ts";
 import { type ParsedStdioServerInput, parseMcpConfigJson, parseMcpExposureEnv } from "../mcp/config.ts";
 import type { JeheeMcpExposure, JeheeMcpOptions, JeheeMcpServerSpec } from "../mcp/contract.ts";
+import {
+	type CustomCodingAgentTemplate,
+	parseWorkshopDriverName,
+	type WorkshopDriverName,
+} from "../workshop/coding-agent-driver.ts";
 import { createJeheeModels, DEFAULT_JEHEE_MODEL_SPEC, type EnvDictionary, resolveModelSpec } from "./models.ts";
 
 /** Parsed and validated configuration driving a Jehee runtime instance. */
@@ -25,6 +30,14 @@ export type JeheeRuntimeConfig = {
 		readonly baseUrl?: string;
 		readonly worktreesRoot?: string;
 	};
+	readonly localWorkshop?: {
+		readonly worktreesRoot: string;
+		readonly defaultRepoPath?: string;
+	};
+	readonly workshopDriver?: WorkshopDriverName;
+	readonly workshopAgentModel?: string;
+	readonly workshopDefaultRepo?: string;
+	readonly workshopCustomTemplate?: CustomCodingAgentTemplate;
 	readonly mcp?: JeheeMcpOptions;
 	readonly mcpExposure?: JeheeMcpExposure;
 	readonly writeGate?: WriteApprovalPolicy;
@@ -40,6 +53,47 @@ function splitCsv(raw: string | undefined): string[] {
 		.split(",")
 		.map((item) => item.trim())
 		.filter((item) => item.length > 0);
+}
+
+function parseCustomAgentTemplateEnv(raw: string | undefined): CustomCodingAgentTemplate | undefined {
+	const trimmed = raw?.trim();
+	if (trimmed === undefined || trimmed.length === 0) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch (error) {
+		throw new Error(
+			`Invalid JEHEE_WORKSHOP_CUSTOM_ARGV JSON: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string") && parsed.length > 0) {
+		return { initialArgv: parsed };
+	}
+	if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+		const rec = parsed as Record<string, unknown>;
+		if (
+			Array.isArray(rec.initialArgv) &&
+			rec.initialArgv.every((x) => typeof x === "string") &&
+			rec.initialArgv.length > 0
+		) {
+			const cont =
+				rec.continueArgv !== undefined
+					? Array.isArray(rec.continueArgv) && rec.continueArgv.every((x) => typeof x === "string")
+						? (rec.continueArgv as string[])
+						: undefined
+					: undefined;
+			if (rec.continueArgv !== undefined && cont === undefined) {
+				throw new Error("JEHEE_WORKSHOP_CUSTOM_ARGV.continueArgv must be an array of strings");
+			}
+			return {
+				initialArgv: rec.initialArgv as string[],
+				...(cont !== undefined ? { continueArgv: cont } : {}),
+			};
+		}
+	}
+	throw new Error(
+		'JEHEE_WORKSHOP_CUSTOM_ARGV must be a non-empty string array or `{ "initialArgv": [...], "continueArgv"?: [...] }`',
+	);
 }
 
 /** Parses and validates a `JeheeRuntimeConfig` from an environment dictionary. */
@@ -74,6 +128,24 @@ export function parseJeheeEnvConfig(
 					...(env.INSTABOX_WORKTREES_ROOT?.trim() ? { worktreesRoot: env.INSTABOX_WORKTREES_ROOT.trim() } : {}),
 				}
 			: undefined;
+
+	const workshopDefaultRepo = env.JEHEE_WORKSHOP_DEFAULT_REPO?.trim() || undefined;
+	const localRoot = env.JEHEE_WORKSHOP_LOCAL_ROOT?.trim();
+	const localWorkshop =
+		localRoot !== undefined && localRoot.length > 0
+			? {
+					worktreesRoot: localRoot,
+					...(workshopDefaultRepo !== undefined ? { defaultRepoPath: workshopDefaultRepo } : {}),
+				}
+			: undefined;
+
+	const rawDriver = env.JEHEE_WORKSHOP_DRIVER?.trim();
+	const workshopDriver =
+		rawDriver !== undefined && rawDriver.length > 0
+			? parseWorkshopDriverName(rawDriver, "JEHEE_WORKSHOP_DRIVER")
+			: undefined;
+	const workshopAgentModel = env.JEHEE_WORKSHOP_AGENT_MODEL?.trim() || undefined;
+	const workshopCustomTemplate = parseCustomAgentTemplateEnv(env.JEHEE_WORKSHOP_CUSTOM_ARGV);
 
 	const rawDebounce = env.JEHEE_DEBOUNCE_MS?.trim();
 	const debounceMs = rawDebounce !== undefined && rawDebounce.length > 0 ? Number(rawDebounce) : 0;
@@ -139,6 +211,11 @@ export function parseJeheeEnvConfig(
 		stagingAllowedRoutes: splitCsv(env.JEHEE_STAGING_ROUTES),
 		debounceMs,
 		...(instabox !== undefined ? { instabox } : {}),
+		...(localWorkshop !== undefined ? { localWorkshop } : {}),
+		...(workshopDriver !== undefined ? { workshopDriver } : {}),
+		...(workshopAgentModel !== undefined ? { workshopAgentModel } : {}),
+		...(workshopDefaultRepo !== undefined ? { workshopDefaultRepo } : {}),
+		...(workshopCustomTemplate !== undefined ? { workshopCustomTemplate } : {}),
 		...(mcp !== undefined ? { mcp } : {}),
 		...(mcpExposure !== undefined ? { mcpExposure } : {}),
 		...(writeGate !== undefined ? { writeGate } : {}),
