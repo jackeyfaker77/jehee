@@ -43,6 +43,13 @@ export {
 	type TurnCompletedEvent,
 } from "./memory/contract.ts";
 export { type StaticCoreMemoryOptions, StaticCoreMemoryProvider } from "./memory/static-core.ts";
+export { type JeheeRuntimeConfig, parseJeheeEnvConfig } from "./runtime/config.ts";
+export {
+	createJeheeModels,
+	DEFAULT_JEHEE_MODEL_SPEC,
+	type EnvDictionary,
+	resolveModelSpec,
+} from "./runtime/models.ts";
 export {
 	createWorkshopBundle,
 	type WorkshopBundle,

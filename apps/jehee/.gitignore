@@ -1,0 +1,8 @@
+.env
+.dev.vars
+.wrangler/
+.jehee-data/
+dist/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

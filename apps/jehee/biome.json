@@ -16,6 +16,6 @@
 		}
 	},
 	"files": {
-		"includes": ["src/**", "features/**/*.ts", "scripts/**", "test/**", "*.json"]
+		"includes": ["*.ts", "src/**", "features/**/*.ts", "scripts/**", "test/**", "*.json", "*.jsonc"]
 	}
 }

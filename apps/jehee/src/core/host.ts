@@ -1,5 +1,6 @@
 // Core runtime host for Jehee: manages storage lifecycle, the single-entry root conversation, busy-turn steering,
-// crash recovery, and hot-swappable memory providers on top of pi-durable.
+// crash recovery, and hot-swappable memory providers on top of pi-durable. Kept 100% Web/Edge portable (no node:sqlite
+// or child_process imports) so the exact same class powers both Node 24 and Cloudflare Workers Durable Objects.
 
 import type { Context } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai";
@@ -11,6 +12,7 @@ import {
 	type EntryId,
 	type Extension,
 	Harness,
+	type HarnessOptions,
 	LiveDoc,
 	MemoryStorage,
 	type ModelRef,
@@ -19,20 +21,16 @@ import {
 	type Submission,
 	type SubmissionId,
 	UserEntry,
+	type Wake,
 } from "@earendil-works/pi-durable";
-import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { createMemoryExtension } from "../memory/bridge.ts";
 import { extractAssistantText, extractUserText, type MemoryProvider } from "../memory/contract.ts";
 import { createWorkshopBundle, type WorkshopBundle, WorkshopRegistryDoc } from "../workshop/extension.ts";
 import type { InstaBoxClient } from "../workshop/instabox-client.ts";
 import type { WorkshopProvisioner } from "../workshop/provisioner.ts";
 
-/** Storage backend configuration for JeheeHost (supports memory, local SQLite, or custom edge/DO storage). */
-export type JeheeStorageConfig =
-	| { readonly kind: "memory" }
-	| { readonly kind: "sqlite"; readonly path: string }
-	| { readonly kind: "custom"; readonly storage: Storage };
+/** Portable storage backend configuration for JeheeHost. */
+export type JeheeStorageConfig = { readonly kind: "memory" } | { readonly kind: "custom"; readonly storage: Storage };
 
 /** Optional cloud workshop configuration attached to JeheeHost. */
 export type JeheeWorkshopOptions = {
@@ -50,6 +48,9 @@ export type JeheeHostOptions = {
 	readonly workshop?: JeheeWorkshopOptions;
 	readonly extensions?: readonly Extension[];
 	readonly cwd?: string;
+	readonly env?: HarnessOptions["env"];
+	readonly now?: () => number;
+	readonly onWake?: (wake: Wake) => void;
 };
 
 /** Inbound user message delivered to the single-entry root conversation. */
@@ -91,7 +92,7 @@ export class JeheeHost {
 	readonly #harness: Harness;
 	readonly #registry: Registry;
 	readonly #root: Conversation;
-	readonly #proactiveListeners = new Set<(replyText: string) => void | Promise<void>>();
+	readonly #proactiveListeners: Set<(replyText: string) => void | Promise<void>>;
 	#memoryProvider: MemoryProvider | undefined;
 
 	private constructor(
@@ -110,12 +111,7 @@ export class JeheeHost {
 
 	/** Opens storage, installs extensions and memory, initializes or reattaches the root conversation, and resumes pending tasks. */
 	static async open(options: JeheeHostOptions, context: Context): Promise<JeheeHost> {
-		const storage: Storage =
-			options.storage.kind === "memory"
-				? new MemoryStorage()
-				: options.storage.kind === "sqlite"
-					? await openNodeSqliteStorage(options.storage.path)
-					: options.storage.storage;
+		const storage: Storage = options.storage.kind === "memory" ? new MemoryStorage() : options.storage.storage;
 		const registry = createRegistry();
 		const proactiveListeners = new Set<(replyText: string) => void | Promise<void>>();
 		for (const ext of options.extensions ?? []) {
@@ -138,13 +134,14 @@ export class JeheeHost {
 			registry.install(workshopBundle.orchestratorExtension);
 			registry.install(workshopBundle.sandboxExtension);
 		}
-		const defaultCwd = options.cwd ?? process.cwd();
 		const harness = await Harness.open(
 			storage,
 			{
 				models: options.models,
 				registry,
-				env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? defaultCwd }),
+				...(options.env !== undefined ? { env: options.env } : {}),
+				...(options.now !== undefined ? { now: options.now } : {}),
+				...(options.onWake !== undefined ? { onWake: options.onWake } : {}),
 				settings: {
 					followUpMode: "all",
 					steeringMode: "all",
@@ -181,6 +178,16 @@ export class JeheeHost {
 	/** Currently mounted memory provider, if any. */
 	get memoryProvider(): MemoryProvider | undefined {
 		return this.#memoryProvider;
+	}
+
+	/** Current wake status of the underlying durable scheduler (for Cloudflare Durable Object alarms). */
+	wake(): Wake {
+		return this.#harness.wake();
+	}
+
+	/** Resumes durable task scheduling after an external alarm wake-up. */
+	resume(): void {
+		this.#harness.resume();
 	}
 
 	/** Hot-swaps the active MemoryProvider in place without dropping conversation history or restarting the host. */

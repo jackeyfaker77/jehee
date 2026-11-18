@@ -73,8 +73,9 @@
 
 | 切片 | 目标交付物 | 验收标志（BDD Scenarios） |
 | :--- | :--- | :--- |
-| **Slice 1（当前）** | **最小常驻宿主骨架（`JeheeHost`）+ 可插拔记忆底座 + Cucumber BDD 体系** | 通过 Gherkin 场景验证：单入口问答与 `requestId` 幂等、SQLite 重启持久化恢复、忙时 `steer` 插话纠偏、记忆插件热插拔生效且不污染底层事实。 |
-| **Slice 2** | **单入口交互网关（本地 CLI + 首个 IM 渠道 Telegram/QQ）+ 连发合并与中断控制** | 用户可在真实聊天入口与常驻进程对话，支持连发消息合并、`/status` 查看状态与 `/stop` 取消当前回合。 |
-| **Slice 3** | **工坊板块（后台子会话 + 独立 Git Worktree 编排 + 完工回执）** | 主入口可将开发/长任务派发至独立 Worktree，主窗口继续正常秒回闲聊，子任务完工后自动汇报结果摘要。 |
+| **Slice 1（已完成）** | **最小常驻宿主骨架（`JeheeHost`）+ 可插拔记忆底座 + Cucumber BDD 体系** | 通过 Gherkin 场景验证：单入口问答与 `requestId` 幂等、SQLite 重启持久化恢复、忙时 `steer` 插话纠偏、记忆插件热插拔生效且不污染底层事实。 |
+| **Slice 2（已完成）** | **单入口交互网关（`ChannelGateway` + Telegram 适配器）+ 连发合并与中断控制** | 支持白名单鉴权、空闲防抖合并、忙时自动 `steer`、`/status` 与 `/stop` 确定性指令、跨渠道单根会话无缝切换。 |
+| **Slice 3（已完成）** | **云工坊板块（InstaBox 云电脑按需唤醒 + 多 Git Worktree 沙箱隔离 + 完工回执）** | 主入口可将开发/长任务派发至 `/data/jehee/worktrees/<task>`，主窗口保持无重型工具污染，子任务完工后主动向最新活跃渠道推送精简汇报。 |
+| **Slice 3.5（当前）** | **双栖运行入口（本地 CLI / Telegram 守护进程 + Cloudflare Workers DO）+ `opencode-go` 模型目录** | 默认接入 `opencode-go`（含 34 款模型）及多厂商注册表；一套代码同时支持本地 `.env` 直跑与 Cloudflare Free Worker 零月租部署（通过 Edge 打包门禁）。 |
 | **Slice 4** | **四层抽屉记忆插件与甜点窗口换窗（Handoff）治理** | 长程对话自动维持在甜点 Token 区间，跨窗口切换无感，L1-L4 分层读写与虚拟时钟过期测试全部通过。 |
 | **Slice 5** | **确定性主动门控 + 主导者定义的记忆层对比 Eval** | 接入日程/任务源主动提醒门控；对 `StaticCoreMemory` 与 `FourTierDrawerMemory` 输出召回率、幻觉率与缓存真实成本对比报告。 |

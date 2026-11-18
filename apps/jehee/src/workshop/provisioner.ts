@@ -60,49 +60,51 @@ export class SingleBoxWorktreeProvisioner implements WorkshopProvisioner {
 	/** Wakes the machine if paused/stopped and creates an isolated git worktree (or scratch folder when `repoPath` is omitted). */
 	async prepareWorkspace(request: ProvisionWorkspaceRequest): Promise<ProvisionedWorkspace> {
 		const slug = validateTaskSlug(request.taskName);
-		await this.#client.ensureRunning(this.#machineId, request.idempotencyKey);
+		const machine = await this.#client.ensureRunning(this.#machineId, request.idempotencyKey);
+		const canonicalMachineId = machine.id;
 		const cwd = posix.join(this.#worktreesRoot, slug);
 
 		if (request.repoPath === undefined || request.repoPath.trim().length === 0) {
-			const mkdirRes = await this.#client.exec(this.#machineId, {
+			const mkdirRes = await this.#client.exec(canonicalMachineId, {
 				argv: ["mkdir", "-p", cwd],
 			});
 			if (mkdirRes.exitCode !== 0) {
 				throw new Error(`Failed to create workshop directory ${cwd}: ${mkdirRes.stderr}`);
 			}
-			return { machineId: this.#machineId, cwd };
+			return { machineId: canonicalMachineId, cwd };
 		}
 
 		const repoPath = posix.normalize(request.repoPath.trim());
 		const branchName = `jehee/${slug}`;
-		await this.#client.exec(this.#machineId, {
+		await this.#client.exec(canonicalMachineId, {
 			argv: ["mkdir", "-p", this.#worktreesRoot],
 		});
 
 		// Idempotent check: if the worktree already exists from an interrupted attempt, reuse it cleanly.
-		const checkExisting = await this.#client.exec(this.#machineId, {
+		const checkExisting = await this.#client.exec(canonicalMachineId, {
 			argv: ["test", "-e", posix.join(cwd, ".git")],
 		});
 		if (checkExisting.exitCode === 0) {
-			return { machineId: this.#machineId, cwd, repoPath, branchName };
+			return { machineId: canonicalMachineId, cwd, repoPath, branchName };
 		}
 
 		const gitArgs =
 			request.baseRef !== undefined && request.baseRef.trim().length > 0
 				? ["git", "-C", repoPath, "worktree", "add", "-B", branchName, cwd, request.baseRef.trim()]
 				: ["git", "-C", repoPath, "worktree", "add", "-B", branchName, cwd];
-		const wtRes = await this.#client.exec(this.#machineId, { argv: gitArgs });
+		const wtRes = await this.#client.exec(canonicalMachineId, { argv: gitArgs });
 		if (wtRes.exitCode !== 0) {
 			throw new Error(`Failed to create git worktree at ${cwd}: ${wtRes.stderr || wtRes.stdout}`);
 		}
-		return { machineId: this.#machineId, cwd, repoPath, branchName };
+		return { machineId: canonicalMachineId, cwd, repoPath, branchName };
 	}
 
 	/** Removes the isolated git worktree or scratch directory on the woke machine. */
 	async cleanupWorkspace(workspace: ProvisionedWorkspace, idempotencyKey: string): Promise<void> {
-		await this.#client.ensureRunning(workspace.machineId, idempotencyKey);
+		const machine = await this.#client.ensureRunning(workspace.machineId, idempotencyKey);
+		const canonicalMachineId = machine.id;
 		if (workspace.repoPath !== undefined) {
-			const res = await this.#client.exec(workspace.machineId, {
+			const res = await this.#client.exec(canonicalMachineId, {
 				argv: ["git", "-C", workspace.repoPath, "worktree", "remove", "--force", workspace.cwd],
 			});
 			if (res.exitCode !== 0) {
@@ -110,7 +112,7 @@ export class SingleBoxWorktreeProvisioner implements WorkshopProvisioner {
 			}
 			return;
 		}
-		await this.#client.exec(workspace.machineId, {
+		await this.#client.exec(canonicalMachineId, {
 			argv: ["rm", "-rf", workspace.cwd],
 		});
 	}

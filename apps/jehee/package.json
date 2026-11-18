@@ -5,7 +5,11 @@
 	"description": "Jehee: always-on personal colleague bot built on pi-durable",
 	"type": "module",
 	"scripts": {
-		"check": "node ../../scripts/biome-check.mjs && tsc --noEmit",
+		"jehee": "node --conditions=source --disable-warning=ExperimentalWarning bin.ts",
+		"start:cli": "node --conditions=source --disable-warning=ExperimentalWarning bin.ts chat",
+		"start:telegram": "node --conditions=source --disable-warning=ExperimentalWarning bin.ts telegram",
+		"check": "node ../../scripts/biome-check.mjs && tsc --noEmit && npm run check:worker-bundle",
+		"check:worker-bundle": "node --conditions=source --disable-warning=ExperimentalWarning scripts/check-worker-bundle.ts",
 		"format": "node ../../scripts/biome-check.mjs --write",
 		"test": "npm run test:unit && npm run test:bdd",
 		"test:unit": "node --conditions=source --disable-warning=ExperimentalWarning --test --test-reporter=spec \"test/*.test.ts\"",
@@ -22,6 +26,7 @@
 		"@earendil-works/pi-telemetry": "1.5.2"
 	},
 	"devDependencies": {
-		"@cucumber/cucumber": "13.3.0"
+		"@cucumber/cucumber": "13.3.0",
+		"esbuild": "0.28.2"
 	}
 }

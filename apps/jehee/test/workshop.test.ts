@@ -2,7 +2,12 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { InstaBoxClient, resolveScopedSandboxPath, validateTaskSlug } from "../src/index.ts";
+import {
+	InstaBoxClient,
+	resolveScopedSandboxPath,
+	SingleBoxWorktreeProvisioner,
+	validateTaskSlug,
+} from "../src/index.ts";
 
 describe("workshop sandbox safety and client", () => {
 	it("validates task slugs and blocks shell/path metacharacters", () => {
@@ -48,5 +53,41 @@ describe("workshop sandbox safety and client", () => {
 		assert.ok(calls[0]?.url.includes("parents=true"));
 		assert.equal(calls[1]?.method, "GET");
 		assert.ok(calls[1]?.url.includes("/v1/machines/m-1/files/content?path="));
+	});
+
+	it("resolves human machine names to canonical m_... IDs before resume and exec", async () => {
+		const paths: string[] = [];
+		let state: "suspended" | "running" = "suspended";
+		const client = new InstaBoxClient({
+			apiKey: "ibk_unit_123",
+			fetchImpl: async (input, init) => {
+				const url = new URL(String(input));
+				const method = init?.method ?? "GET";
+				paths.push(`${method} ${url.pathname}`);
+				if (
+					method === "GET" &&
+					(url.pathname === "/v1/machines/achi" || url.pathname === "/v1/machines/m_real123")
+				) {
+					return Response.json({ id: "m_real123", name: "achi", state });
+				}
+				if (method === "POST" && url.pathname === "/v1/machines/m_real123/resume") {
+					state = "running";
+					return Response.json({ id: "op_1", machineId: "m_real123", state: "succeeded" });
+				}
+				if (method === "POST" && url.pathname === "/v1/machines/m_real123/exec") {
+					return Response.json({ stdout: "", stderr: "", exitCode: 0, timedOut: false, truncated: false });
+				}
+				return new Response("not found", { status: 404 });
+			},
+		});
+		const provisioner = new SingleBoxWorktreeProvisioner({ client, machineId: "achi" });
+		const ws = await provisioner.prepareWorkspace({ taskName: "smoke-verify", idempotencyKey: "idem-1" });
+		assert.equal(ws.machineId, "m_real123");
+		assert.deepEqual(paths, [
+			"GET /v1/machines/achi",
+			"POST /v1/machines/m_real123/resume",
+			"GET /v1/machines/m_real123",
+			"POST /v1/machines/m_real123/exec",
+		]);
 	});
 });

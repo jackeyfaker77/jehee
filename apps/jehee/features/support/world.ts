@@ -13,6 +13,7 @@ import type { ChannelGateway } from "../../src/channels/gateway.ts";
 import { JeheeHost, type JeheePendingTurn, type JeheeTurnReply } from "../../src/core/host.ts";
 import type { MemoryProvider } from "../../src/memory/contract.ts";
 import type { StaticCoreMemoryProvider } from "../../src/memory/static-core.ts";
+import { openNodeJeheeHost } from "../../src/runtime/node.ts";
 
 /** Shared scenario state for Jehee BDD steps. */
 export class JeheeWorld extends World {
@@ -62,15 +63,26 @@ export class JeheeWorld extends World {
 
 	/** Opens a JeheeHost against memory or a scenario-scoped temporary SQLite file. */
 	async openHost(mode: "memory" | "sqlite", memory?: MemoryProvider): Promise<JeheeHost> {
-		if (mode === "sqlite" && this.sqlitePath === undefined) {
-			this.tempDir = await mkdtemp(join(tmpdir(), "jehee-bdd-"));
-			this.sqlitePath = join(this.tempDir, "jehee.sqlite");
+		if (mode === "sqlite") {
+			if (this.sqlitePath === undefined) {
+				this.tempDir = await mkdtemp(join(tmpdir(), "jehee-bdd-"));
+				this.sqlitePath = join(this.tempDir, "jehee.sqlite");
+			}
+			this.host = await openNodeJeheeHost(
+				{
+					sqlitePath: this.sqlitePath,
+					models: this.models,
+					defaultModel: { provider: "faux", modelId: this.faux.getModel().id },
+					memory,
+					extensions: this.customExtensions,
+				},
+				this.ctx,
+			);
+			return this.host;
 		}
-		const storage =
-			mode === "memory" ? ({ kind: "memory" } as const) : ({ kind: "sqlite", path: this.sqlitePath! } as const);
 		this.host = await JeheeHost.open(
 			{
-				storage,
+				storage: { kind: "memory" },
 				models: this.models,
 				defaultModel: { provider: "faux", modelId: this.faux.getModel().id },
 				memory,

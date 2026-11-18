@@ -1,0 +1,23 @@
+{
+	"name": "jehee-bot",
+	"main": "./worker.ts",
+	"compatibility_date": "2026-10-01",
+	"compatibility_flags": ["nodejs_compat"],
+	"vars": {
+		"JEHEE_MODEL": "opencode-go/glm-5.3-flash"
+	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "JEHEE_DO",
+				"class_name": "JeheeSessionDO"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["JeheeSessionDO"]
+		}
+	]
+}

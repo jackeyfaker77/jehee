@@ -139,25 +139,29 @@ export class InstaBoxClient {
 		throw new Error(`InstaBox operation ${operationId} timed out after ${this.#maxPolls} polls`);
 	}
 
-	/** Ensures `machineId` is in the `running` state, transparently resuming or starting it when idle-paused or stopped. */
-	async ensureRunning(machineId: string, idempotencyPrefix: string): Promise<InstaBoxMachine> {
-		const current = await this.getMachine(machineId);
+	/**
+	 * Ensures `machineIdOrName` is in the `running` state, transparently resolving human machine names (e.g. `"achi"`)
+	 * to their canonical `m_...` ID before issuing `resume` / `start` mutations (which require canonical IDs).
+	 */
+	async ensureRunning(machineIdOrName: string, idempotencyPrefix: string): Promise<InstaBoxMachine> {
+		const current = await this.getMachine(machineIdOrName);
+		const canonicalId = current.id;
 		if (current.state === "running") return current;
 		if (current.state === "suspended") {
-			const op = await this.resumeMachine(machineId, `${idempotencyPrefix}:resume`);
+			const op = await this.resumeMachine(canonicalId, `${idempotencyPrefix}:resume`);
 			if (op.state !== "succeeded") await this.waitOperation(op.id);
-			return this.getMachine(machineId);
+			return this.getMachine(canonicalId);
 		}
 		if (current.state === "stopped") {
-			const op = await this.startMachine(machineId, `${idempotencyPrefix}:start`);
+			const op = await this.startMachine(canonicalId, `${idempotencyPrefix}:start`);
 			if (op.state !== "succeeded") await this.waitOperation(op.id);
-			return this.getMachine(machineId);
+			return this.getMachine(canonicalId);
 		}
 		if ((current.state === "starting" || current.state === "resuming") && current.operationId) {
 			await this.waitOperation(current.operationId);
-			return this.getMachine(machineId);
+			return this.getMachine(canonicalId);
 		}
-		throw new Error(`InstaBox machine ${machineId} cannot be woken from state "${current.state}"`);
+		throw new Error(`InstaBox machine ${canonicalId} cannot be woken from state "${current.state}"`);
 	}
 
 	/** Executes a shell command or argv program inside a running sandbox. */
