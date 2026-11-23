@@ -183,6 +183,28 @@ export {
 	type TurnCompletedEvent,
 } from "./memory/contract.ts";
 export { MemoryConsolidationDoc, MemoryDoc } from "./memory/durable-store.ts";
+export {
+	applyPortableMemoryImport,
+	type BuildPortableSnapshotInput,
+	buildPortableSnapshot,
+	type ExportSnapshotOptions,
+	formatImportSnapshotReply,
+	type ImportSnapshotMode,
+	type ImportSnapshotOptions,
+	type ImportSnapshotResult,
+	type ParsePortableSnapshotResult,
+	PORTABLE_SNAPSHOT_SCHEMA,
+	PORTABLE_SNAPSHOT_VERSION,
+	type PortableContextSnapshot,
+	type PortableDialogueRole,
+	type PortableDialogueTurn,
+	type PortableMemoryApplyOutcome,
+	type PortableMemoryRecord,
+	type PortableTranscriptScope,
+	parsePortableSnapshotJson,
+	renderPortableSnapshotMarkdown,
+	serializePortableSnapshotJson,
+} from "./memory/portable-snapshot.ts";
 export { type StaticCoreMemoryOptions, StaticCoreMemoryProvider } from "./memory/static-core.ts";
 export { type JeheeRuntimeConfig, parseJeheeEnvConfig } from "./runtime/config.ts";
 export {

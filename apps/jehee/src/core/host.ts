@@ -3,13 +3,16 @@
 // or child_process imports) so the exact same class powers both Node 24 and Cloudflare Workers Durable Objects.
 
 import type { Context } from "@earendil-works/chord/context";
-import type { Models } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Models } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
+	CompactionEntry,
 	type Conversation,
 	type ConversationId,
+	type Cursor,
 	createRegistry,
 	type EntryId,
+	type EntryRecord,
 	type Extension,
 	Harness,
 	type HarnessOptions,
@@ -17,6 +20,7 @@ import {
 	MemoryStorage,
 	type ModelRef,
 	type Registry,
+	ResetEntry,
 	type Storage,
 	type Submission,
 	type SubmissionId,
@@ -60,6 +64,16 @@ import {
 	type MemorySearchQuery,
 } from "../memory/contract.ts";
 import { MemoryConsolidationDoc, MemoryDoc } from "../memory/durable-store.ts";
+import {
+	applyPortableMemoryImport,
+	buildPortableSnapshot,
+	type ExportSnapshotOptions,
+	type ImportSnapshotOptions,
+	type ImportSnapshotResult,
+	type PortableContextSnapshot,
+	type PortableDialogueTurn,
+} from "../memory/portable-snapshot.ts";
+import { startJeheeMemorySpan } from "../telemetry/recorder.ts";
 import type { WorkshopExecutionBackend } from "../workshop/backend.ts";
 import type { CustomCodingAgentTemplate, WorkshopDriverName } from "../workshop/coding-agent-driver.ts";
 import { createWorkshopBundle, type WorkshopBundle, WorkshopRegistryDoc } from "../workshop/extension.ts";
@@ -186,6 +200,49 @@ export type HostMemoryForgetResult =
 export type HostMemoryRestoreResult =
 	| MemoryRestoreResult
 	| { readonly ok: false; readonly reason: "unsupported"; readonly message: string };
+
+function extractPortableTurns(entries: readonly EntryRecord[]): PortableDialogueTurn[] {
+	const turns: PortableDialogueTurn[] = [];
+	for (const entry of entries) {
+		const firstMsg = entry.model?.[0];
+		if (UserEntry.is(entry) && firstMsg?.role === "user") {
+			const text = extractUserText(firstMsg).trim();
+			if (text.length > 0) {
+				turns.push({
+					id: String(entry.id),
+					role: "user",
+					text,
+					timestampMs: firstMsg.timestamp,
+				});
+			}
+		} else if (AssistantEntry.is(entry) && firstMsg?.role === "assistant" && firstMsg.stopReason === "stop") {
+			const text = extractAssistantText(firstMsg).trim();
+			if (text.length > 0) {
+				turns.push({
+					id: String(entry.id),
+					role: "assistant",
+					text,
+					timestampMs: firstMsg.timestamp,
+					model: {
+						provider: firstMsg.provider,
+						modelId: firstMsg.model,
+					},
+				});
+			}
+		} else if ((CompactionEntry.is(entry) || ResetEntry.is(entry)) && firstMsg?.role === "user") {
+			const text = extractUserText(firstMsg).trim();
+			if (text.length > 0) {
+				turns.push({
+					id: String(entry.id),
+					role: "summary",
+					text,
+					timestampMs: firstMsg.timestamp,
+				});
+			}
+		}
+	}
+	return turns;
+}
 
 /** Always-on personal colleague host wrapping a durable Session and its root conversation. */
 export class JeheeHost {
@@ -520,6 +577,240 @@ export class JeheeHost {
 			const doc = await tx.doc(MemoryDoc);
 			return atomic.restore(doc, id, this.#now());
 		}, context);
+	}
+
+	/** Exports a harness- and model-independent portable snapshot of memory and conversation context. */
+	async exportPortableSnapshot(context: Context, options?: ExportSnapshotOptions): Promise<PortableContextSnapshot> {
+		const scope = options?.transcriptScope ?? "active";
+		const telemetry = this.#telemetry ?? context.telemetry;
+		return startJeheeMemorySpan(telemetry)("jehee.memory.export", { "snapshot.scope": scope }, async (span) => {
+			let entries: EntryRecord[];
+			if (scope === "full") {
+				entries = [];
+				let cursor: Cursor | undefined;
+				while (true) {
+					const page = await this.#root.entries({ order: "ascending" }, 256, cursor, context);
+					entries.push(...page.items);
+					if (page.next === undefined) break;
+					cursor = page.next;
+				}
+			} else {
+				const view = await this.#root.context(context);
+				entries = [...view.entries];
+			}
+			const turns = extractPortableTurns(entries);
+
+			const provider = this.#memoryHolder.current;
+			const atomic = provider?.atomic;
+			const memoryState =
+				atomic !== undefined
+					? ((await this.#harness.snapshot(MemoryDoc, context)) ?? createEmptyMemoryStoreState())
+					: undefined;
+			const corePrompt =
+				atomic !== undefined && memoryState !== undefined
+					? atomic.renderCoreFromState(memoryState)
+					: await provider?.renderCorePrompt?.(String(this.#root.id));
+
+			const snapshot = buildPortableSnapshot({
+				exportedAtMs: this.#now(),
+				memoryProviderId: provider?.id ?? "none",
+				defaultModel: this.#defaultModel,
+				conversationId: String(this.#root.id),
+				...(atomic?.seedCorePrompt !== undefined ? { seedCorePrompt: atomic.seedCorePrompt } : {}),
+				...(corePrompt !== undefined ? { corePrompt } : {}),
+				...(memoryState !== undefined ? { memoryState } : {}),
+				scope,
+				turns,
+				...(options?.includeForgotten !== undefined ? { includeForgotten: options.includeForgotten } : {}),
+				...(options?.maxTurns !== undefined ? { maxTurns: options.maxTurns } : {}),
+			});
+			span.setAttributes({
+				"snapshot.memory_count": snapshot.memory.items.length,
+				"snapshot.turn_count": snapshot.context.turns.length,
+			});
+			return snapshot;
+		});
+	}
+
+	/** Atomically imports a portable snapshot into atomic memory (`MemoryDoc`) and/or the root conversation transcript. */
+	async importPortableSnapshot(
+		snapshot: PortableContextSnapshot,
+		context: Context,
+		options?: ImportSnapshotOptions,
+	): Promise<ImportSnapshotResult> {
+		const mode = options?.mode ?? "merge";
+		const includeMemory = options?.includeMemory !== false;
+		const includeContext = options?.includeContext !== false;
+		const telemetry = this.#telemetry ?? context.telemetry;
+
+		return startJeheeMemorySpan(telemetry)("jehee.memory.import", { "snapshot.mode": mode }, async (span) => {
+			const atomic = this.#memoryHolder.current?.atomic;
+			const result = await this.#root.commit(async (tx): Promise<ImportSnapshotResult> => {
+				const wantsContextWrite = includeContext && (mode === "replace" || snapshot.context.turns.length > 0);
+				if (wantsContextWrite) {
+					const live = await tx.doc(LiveDoc, this.#root.id);
+					if (live.run !== undefined && live.run.afterRun === undefined) {
+						return {
+							ok: false,
+							reason: "host_busy",
+							message: "Cannot import conversation context while the root conversation is busy.",
+						};
+					}
+				}
+
+				let memoriesImported = 0;
+				let memoriesSkippedDuplicates = 0;
+				let memoriesReassignedIds = 0;
+				let memoriesSkipped = 0;
+				let memoryUnsupported: true | undefined;
+				const skippedReasons: string[] = [];
+				let memDocSeq: number | undefined;
+
+				if (includeMemory) {
+					if (atomic !== undefined) {
+						const memDoc = await tx.doc(MemoryDoc);
+						const applied = applyPortableMemoryImport(memDoc, snapshot.memory.items, {
+							mode,
+							maxCoreChars: atomic.maxCoreChars,
+							...(atomic.seedCorePrompt !== undefined ? { seedCorePrompt: atomic.seedCorePrompt } : {}),
+							...(options?.respectCoreLimit !== undefined ? { respectCoreLimit: options.respectCoreLimit } : {}),
+						});
+						memoriesImported = applied.imported;
+						memoriesSkippedDuplicates = applied.skippedDuplicates;
+						memoriesReassignedIds = applied.reassignedIds;
+						memoriesSkipped = applied.skippedCoreLimit;
+						skippedReasons.push(...applied.skippedReasons);
+						memDocSeq = memDoc.seq;
+					} else if (snapshot.memory.items.length > 0) {
+						memoryUnsupported = true;
+						memoriesSkipped = snapshot.memory.items.length;
+						skippedReasons.push(
+							`Current memory provider "${this.#memoryHolder.current?.id ?? "none"}" does not support atomic memory imports.`,
+						);
+					}
+				}
+
+				let contextTurnsImported = 0;
+				let contextResetApplied = false;
+				let lastImportedEntryId: EntryId | undefined;
+				const nowMs = this.#now();
+
+				if (includeContext) {
+					const turns = snapshot.context.turns;
+					let startIndex = 0;
+					if (mode === "replace") {
+						if (turns.length > 0 && turns[0]!.role === "summary") {
+							const first = turns[0]!;
+							const entry = await tx.appendEntry(ResetEntry, this.#root.id, {
+								head: "self",
+								model: [{ role: "user", content: first.text, timestamp: first.timestampMs ?? nowMs }],
+							});
+							lastImportedEntryId = entry.id;
+							contextResetApplied = true;
+							contextTurnsImported += 1;
+							startIndex = 1;
+						} else if ((await tx.latestEntryId(this.#root.id)) !== undefined) {
+							const entry = await tx.appendEntry(ResetEntry, this.#root.id, { head: "self" });
+							lastImportedEntryId = entry.id;
+							contextResetApplied = true;
+						}
+					}
+
+					for (let i = startIndex; i < turns.length; i += 1) {
+						const turn = turns[i]!;
+						const ts = turn.timestampMs ?? nowMs;
+						if (turn.role === "summary") {
+							if (mode === "replace") {
+								const entry = await tx.appendEntry(ResetEntry, this.#root.id, {
+									head: "self",
+									model: [{ role: "user", content: turn.text, timestamp: ts }],
+								});
+								lastImportedEntryId = entry.id;
+								contextResetApplied = true;
+							} else {
+								const entry = await tx.appendEntry(UserEntry, this.#root.id, {
+									model: [
+										{ role: "user", content: `[Imported Context Summary]\n${turn.text}`, timestamp: ts },
+									],
+								});
+								lastImportedEntryId = entry.id;
+							}
+							contextTurnsImported += 1;
+						} else if (turn.role === "user") {
+							const entry = await tx.appendEntry(UserEntry, this.#root.id, {
+								model: [{ role: "user", content: turn.text, timestamp: ts }],
+							});
+							lastImportedEntryId = entry.id;
+							contextTurnsImported += 1;
+						} else {
+							const assistantMsg: AssistantMessage = {
+								role: "assistant",
+								content: [{ type: "text", text: turn.text }],
+								api: "openai-completions",
+								provider: turn.model?.provider ?? "portable-import",
+								model: turn.model?.modelId ?? "imported",
+								usage: {
+									input: 0,
+									output: 0,
+									cacheRead: 0,
+									cacheWrite: 0,
+									totalTokens: 0,
+									cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+								},
+								stopReason: "stop",
+								timestamp: ts,
+							};
+							const entry = await tx.appendEntry(AssistantEntry, this.#root.id, {
+								model: [assistantMsg],
+							});
+							lastImportedEntryId = entry.id;
+							contextTurnsImported += 1;
+						}
+					}
+				}
+
+				if (atomic !== undefined && mode === "replace") {
+					const cDoc = await tx.doc(MemoryConsolidationDoc);
+					if (memDocSeq !== undefined) {
+						cDoc.lastConsolidatedMemorySeq = memDocSeq;
+					}
+					if (lastImportedEntryId !== undefined && memoriesImported > 0) {
+						cDoc.lastConsolidatedEntryId = String(lastImportedEntryId);
+					} else if (contextResetApplied && lastImportedEntryId === undefined) {
+						const latestId = await tx.latestEntryId(this.#root.id);
+						if (latestId !== undefined) {
+							cDoc.lastConsolidatedEntryId = String(latestId);
+						}
+					}
+				}
+
+				return {
+					ok: true,
+					mode,
+					memoriesImported,
+					memoriesSkippedDuplicates,
+					memoriesReassignedIds,
+					memoriesSkipped,
+					...(memoryUnsupported !== undefined ? { memoryUnsupported } : {}),
+					contextTurnsImported,
+					contextResetApplied,
+					skippedReasons,
+				};
+			}, context);
+
+			if (!result.ok) {
+				span.setAttributes({ "snapshot.outcome": result.reason });
+				span.setStatus({ status: "error", error: { name: result.reason, message: result.message } });
+				return result;
+			}
+			span.setAttributes({
+				"snapshot.memories_imported": result.memoriesImported,
+				"snapshot.memories_skipped": result.memoriesSkipped + result.memoriesSkippedDuplicates,
+				"snapshot.turns_imported": result.contextTurnsImported,
+				"snapshot.outcome": "ok",
+			});
+			return result;
+		});
 	}
 
 	/** Durably admits a user message (or returns the existing submission on matching `requestId`) without blocking on completion. */

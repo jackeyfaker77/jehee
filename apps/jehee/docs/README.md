@@ -54,6 +54,7 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [ADR-0009](./adr/0009-external-coding-agent-workshop-gateway.md) | 工坊升级为双执行面外部 Coding Agent 网关（Slice 5B） | Accepted | 2026-11-18 | 抽象跨平台 `WorkshopExecutionBackend`（云端 InstaBox + 本机 Git Worktree），内置 `pi`、`opencode`、`antigravity` (`agy`)、`claude`、`codex` 与自定义驱动器，实现后台 PID 轮询与确定性 Git Diff 验收回执。 |
 | [ADR-0010](./adr/0010-atomic-memory-and-eval.md) | 可插拔持久化原子记忆插件（L1 Core 一页纸 + 按需检索 + `/memory`）与 `Eval-0002`（Slice 5C-1） | Accepted | 2026-11-24 | 基于 `pi-durable` `MemoryDoc` 实现 100% 双栖可移植的原子记忆存储、低频 L1 Core 立即刷新、中英关键词/别名/时间检索与 `sourceEntryId` 溯源、软删除墓碑及 `/memory` 确定性指令，并规划 `Eval-0002` 对比评测。 |
 | [ADR-0011](./adr/0011-background-memory-consolidation.md) | 后台空闲/定时异步记忆整理（去重、冲突消解与隐性事实提炼）（Slice 5C-2） | Accepted | 2026-11-24 | 基于 `MemoryConsolidationDoc` 增量水位线、`pi-durable` 单活空闲休眠任务与严格 JSON Patch 校验器，实现零重复扫描的隐性事实提炼、重复合并、冲突消解（墓碑可逆恢复）及 `/memory consolidate` 确定性指令。 |
+| [ADR-0012](./adr/0012-portable-context-memory-snapshot.md) | 上下文与记忆的可移植快照（Portable Export / Import）（Slice 5C-3） | Accepted | 2026-11-24 | 定义 Harness/模型无关的 `jehee.portable.snapshot` v1 格式（无损 JSON + 人类/外部 Agent 可读 Markdown），实现 `JeheeHost` 事务级 `exportPortableSnapshot` / `importPortableSnapshot`（`merge`/`replace` 双模式）、CLI `export`/`import` 与 `/memory export` 白名单指令。 |
 
 ### 评测结论与失败复盘记录（Evals & Postmortems）
 
@@ -103,4 +104,4 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 
 ## 4. 后续计划立项队列
 
-- **ADR-0012（Slice 5D）**：L4 历史压缩抽屉与单窗口无感换窗（Seamless Handoff）。
+- **ADR-0013（Slice 5D）**：L4 历史压缩抽屉与单窗口无感换窗（Seamless Handoff）。

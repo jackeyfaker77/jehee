@@ -202,6 +202,48 @@ export const JEHEE_MEMORY_TELEMETRY_SCHEMA = defineTelemetrySchema({
 				errorWhen: "Consolidation model unavailable, returned invalid JSON, or failed.",
 			},
 		},
+		"jehee.memory.export": {
+			description: "One portable context and memory snapshot export.",
+			parents: { kind: "any" },
+			startAttributes: {
+				"snapshot.scope": {
+					type: "string",
+					required: true,
+					values: ["active", "full"],
+					description: "Transcript scope captured in the portable snapshot.",
+				},
+			},
+			endAttributes: {
+				"snapshot.memory_count": { type: "number", description: "Count of memory records exported." },
+				"snapshot.turn_count": { type: "number", description: "Count of conversation dialogue turns exported." },
+			},
+			status: {
+				default: "ok",
+				errorWhen: "Snapshot export failed to read durable state.",
+			},
+		},
+		"jehee.memory.import": {
+			description: "One atomic portable context and memory snapshot import.",
+			parents: { kind: "any" },
+			startAttributes: {
+				"snapshot.mode": {
+					type: "string",
+					required: true,
+					values: ["merge", "replace"],
+					description: "Import mode applied to target host state.",
+				},
+			},
+			endAttributes: {
+				"snapshot.memories_imported": { type: "number", description: "Count of memory records written." },
+				"snapshot.memories_skipped": { type: "number", description: "Count of memory records skipped." },
+				"snapshot.turns_imported": { type: "number", description: "Count of dialogue turns replayed." },
+				"snapshot.outcome": { type: "string", description: "Outcome status (ok / host_busy)." },
+			},
+			status: {
+				default: "ok",
+				errorWhen: "Import rejected because host was busy or transaction failed.",
+			},
+		},
 	},
 });
 

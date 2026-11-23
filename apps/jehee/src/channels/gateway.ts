@@ -8,6 +8,7 @@ import type { ApprovalTicket } from "../governance/approvals.ts";
 import { ProactiveNotificationGovernor, type ProactiveQuietPolicy } from "../governance/quiet-gate.ts";
 import { formatMemoryInspectReply, formatMemorySearchReply } from "../memory/atomic-memory.ts";
 import { formatConsolidationReportReply } from "../memory/consolidator.ts";
+import { renderPortableSnapshotMarkdown, serializePortableSnapshotJson } from "../memory/portable-snapshot.ts";
 import {
 	type ChannelRoute,
 	type ChannelSendOptions,
@@ -428,6 +429,20 @@ export class ChannelGateway {
 			return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
 		}
 
+		if (sub === "export") {
+			const fmt = rest.toLowerCase() === "json" ? "json" : "md";
+			const snapshot = await this.#host.exportPortableSnapshot(context, { transcriptScope: "active" });
+			const rendered =
+				fmt === "json" ? serializePortableSnapshotJson(snapshot, true) : renderPortableSnapshotMarkdown(snapshot);
+			const maxChatChars = 3_500;
+			const reply =
+				rendered.length <= maxChatChars
+					? rendered.trimEnd()
+					: `${rendered.slice(0, maxChatChars)}\n...\n[已截断，完整快照请运行: npm --prefix apps/jehee run jehee -- export snapshot.${fmt}]`;
+			await this.#deliverOutbound(message.channel, message.chatId, reply, sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
+		}
+
 		if (sub === "search") {
 			if (rest.length === 0) {
 				await this.#deliverOutbound(message.channel, message.chatId, "用法：/memory search <关键词>", sendOpts);
@@ -480,7 +495,7 @@ export class ChannelGateway {
 		await this.#deliverOutbound(
 			message.channel,
 			message.chatId,
-			"用法：/memory [list | search <关键词> | forget <id> | restore <id> | consolidate [--force]]",
+			"用法：/memory [list | search <关键词> | forget <id> | restore <id> | consolidate [--force] | export [md|json]]",
 			sendOpts,
 		);
 		return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
