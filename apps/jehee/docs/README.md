@@ -56,6 +56,7 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | 编号 | 标题 | 关联 ADR | 日期 | 核心结论摘要 |
 | :--- | :--- | :--- | :--- | :--- |
 | [Eval-0001](./evals/0001-mcp-exposure-and-blob-postmortem.md) | MCP 工具暴露策略与二进制附件句柄对比评测及失败复盘 | [ADR-0007](./adr/0007-mcp-connector-skeleton-and-eval.md) | 2026-11-18 | `opencode-go/deepseek-v4.1-flash` 真机与离线双轨实测：70 工具拓扑下默认 `deferred + $jehee_blob:` 相比基线降低 **95.2% 输入 Token**（`492,557 -> 23,648`）、**96.0% 真实账单**（`\$0.03791 -> \$0.00152`）与 **90.6% 耗时**（`342.1s -> 32.1s`），消除 20 KiB 截断诱发的思考螺旋与 `integrity_mismatch`。 |
+| [Audit-0002](./evals/0002-adr-0006-to-0009-gate-audit-and-postmortem.md) | ADR-0006 至 ADR-0009 验收门禁补齐记录与根因复盘 | [ADR-0006](./adr/0006-nonblocking-telegram-polling-and-cli-boundary.md)–[0009](./adr/0009-external-coding-agent-workshop-gateway.md) | 2026-11-24 | 补齐 06–09 轮询守护、默认 `deferred` 资源发现、`approved` 重启消费、`/reject`/`/flush`/忙时与冷却治理、6 驱动首轮参数与 `followUp`/`steer` 全量验证（`33/33` 单测、`32/32` BDD），并修复 Worker 包 `node:child_process` 残留（`1861.6 KiB`）、Windows `stopJob` `EBUSY` 竞态及 `info/exclude` 隔离。 |
 
 ---
 

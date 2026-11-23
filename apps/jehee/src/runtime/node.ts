@@ -216,6 +216,8 @@ export async function runTelegramPollingDaemon(
 		readonly botToken: string;
 		readonly gateway: ChannelGateway;
 		readonly signal: AbortSignal;
+		readonly fetchImpl?: typeof fetch;
+		readonly retryDelayMs?: number;
 	},
 	context: Context,
 ): Promise<void> {
@@ -228,6 +230,7 @@ export async function runTelegramPollingDaemon(
 					gateway: options.gateway,
 					...(offset !== undefined ? { offset } : {}),
 					timeoutSeconds: 20,
+					...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
 					signal: options.signal,
 					onError: (err, msg) => {
 						if (!options.signal.aborted) {
@@ -240,7 +243,7 @@ export async function runTelegramPollingDaemon(
 		} catch (err) {
 			if (options.signal.aborted) break;
 			console.error("[jehee/telegram] poll error, retrying in 3s:", err);
-			await new Promise((resolve) => setTimeout(resolve, 3000));
+			await new Promise((resolve) => setTimeout(resolve, options.retryDelayMs ?? 3000));
 		}
 	}
 }

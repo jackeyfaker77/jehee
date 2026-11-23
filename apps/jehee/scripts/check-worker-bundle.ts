@@ -13,7 +13,8 @@ export type WorkerBundleReport = {
 	readonly externalNodeBuiltins: readonly string[];
 };
 
-const FORBIDDEN_EDGE_BUILTINS = new Set(["node:sqlite", "sqlite"]);
+const FORBIDDEN_PRE_SHAKE_BUILTINS = new Set(["node:sqlite", "sqlite"]);
+const FORBIDDEN_RETAINED_BUILTINS = new Set(["node:sqlite", "sqlite", "node:child_process", "child_process"]);
 
 /** Bundles `worker.ts` for Cloudflare Workers in memory and checks module purity and size bounds. */
 export async function inspectWorkerBundle(): Promise<WorkerBundleReport> {
@@ -24,7 +25,7 @@ export async function inspectWorkerBundle(): Promise<WorkerBundleReport> {
 		write: false,
 		metafile: true,
 		format: "esm",
-		platform: "neutral",
+		platform: "browser",
 		target: "es2024",
 		mainFields: ["browser", "module", "main"],
 		conditions: ["workerd", "worker", "browser", "import", "source"],
@@ -50,8 +51,19 @@ export async function inspectWorkerBundle(): Promise<WorkerBundleReport> {
 	});
 
 	for (const mod of importedBuiltins) {
-		if (FORBIDDEN_EDGE_BUILTINS.has(mod)) {
+		if (FORBIDDEN_PRE_SHAKE_BUILTINS.has(mod)) {
 			throw new Error(`Cloudflare worker bundle must not depend on "${mod}"`);
+		}
+	}
+	const retainedExternals = new Set<string>();
+	for (const output of Object.values(result.metafile.outputs)) {
+		for (const imp of output.imports) {
+			if (FORBIDDEN_RETAINED_BUILTINS.has(imp.path)) {
+				throw new Error(`Cloudflare worker bundle retained forbidden Node builtin "${imp.path}" in final output`);
+			}
+			if (imp.external && imp.path !== "cloudflare:workers") {
+				retainedExternals.add(imp.path);
+			}
 		}
 	}
 	for (const inputPath of Object.keys(result.metafile.inputs)) {
@@ -78,7 +90,7 @@ export async function inspectWorkerBundle(): Promise<WorkerBundleReport> {
 	const outputBytes = result.outputFiles[0]?.contents.byteLength ?? 0;
 	return {
 		byteLength: outputBytes,
-		externalNodeBuiltins: [...importedBuiltins].sort(),
+		externalNodeBuiltins: [...retainedExternals].sort(),
 	};
 }
 

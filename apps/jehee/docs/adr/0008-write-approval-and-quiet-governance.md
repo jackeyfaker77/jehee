@@ -95,11 +95,11 @@ apps/jehee/
 - **Telegram 按钮连点幂等**：用户网络卡顿时可能连续点击两次 `[确认执行]`。第二次点击命中的票据已处于 `"approved"` 或 `"consumed"`，网关仅回复 `answerCallbackQuery("该操作已在处理中")` 并复用同一 `requestId: "approval-resume:<id>"`，绝不触发二次模型推理或二次发信。
 - **程序化基准评测兼容性**：`JeheeHost.open` 在未显式开启 `writeGate: { mode: "confirm-writes" }` 时保持默认直通，确保无人值守的 `eval:mcp` 与历史套件零破坏。
 
-### 5.2 Slice 5A 验收门禁清单（已全部达成）
-- [x] `npm run check`（Biome + `tsc --noEmit` + `check-worker-bundle`）零错误通过（Worker 包 `1885.1 KiB`）。
-- [x] 单元测试（`test/governance.test.ts`）覆盖：跨零点与日内静默窗口计算、参数指纹对 `request_id`/`expected_version` 的豁免与业务字段防篡改、冷却频控与 `[SILENT]` 过滤、Telegram `inline_keyboard` 与 `callback_query`。
+### 5.2 Slice 5A 验收门禁清单（补充复核记录见 [Audit-0002](../evals/0002-adr-0006-to-0009-gate-audit-and-postmortem.md)）
+- [x] `npm run check`（Biome + `tsc --noEmit` + `check-worker-bundle`）零错误通过（经 `Audit-0002` 加固后 Worker 包 `1861.6 KiB`）。
+- [x] 单元测试（`test/governance.test.ts`）覆盖：跨零点与日内静默窗口计算、参数指纹对 `request_id`/`expected_version` 的豁免与业务字段防篡改、冷却频控与 `[SILENT]` 过滤、Telegram `inline_keyboard` 与 `callback_query`、多待批 `ambiguous` 提示、`/approve`、`/reject` 与空 `/flush`。
 - [x] Cucumber BDD（`features/governance-and-approvals.feature`）端到端验证：
   1. 高危写操作被拦截生成 `apv_...` 卡片后主对话保持 `idle` 可自由穿插日常闲聊，点击 Telegram 内联批准按钮（或发 `/approve`）后自动续跑落库，且单次票据消费后不可重放；
-  2. 批准草稿 A 后若模型尝试篡改参数发送草稿 B，参数指纹失配被再次确定性拦截；宿主 SQLite 重启后待批/已批票据不丢失；
-  3. 未授权陌生人点击 Telegram 批准按钮或发送 `/approve` 被白名单直接拦截，零状态变更；
-  4. 静默时段（`23:00-08:00`）、忙时让路与频控冷却准确暂存后台通知且不拦截用户正常问答，发送 `/flush` 或非静默时段交互时完整投递暂存摘要，`[SILENT]` 哨兵实现零打扰。
+  2. 批准草稿 A 后若模型尝试篡改参数发送草稿 B，参数指纹失配被再次确定性拦截；宿主 SQLite 重启后待批（`pending`）与已批（`approved`）票据均不丢失且可消费放行，`exemptTools` 豁免直通、`apv:no:<id>` 取消作废；
+  3. 未授权陌生人点击 Telegram 批准按钮或发送 `/approve` 指令均被白名单直接拒绝，零状态变更；
+  4. 静默时段（`23:00-08:00`）、忙时让路（`busy_yield`）与频控冷却（`rate_cooldown`）准确暂存后台通知且不拦截用户正常问答，发送 `/flush` 或非静默时段交互时完整投递暂存摘要，`[SILENT]` 哨兵实现零打扰。

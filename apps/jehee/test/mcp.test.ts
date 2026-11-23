@@ -183,6 +183,47 @@ describe("MCP blob vault, metric dictionary, and stdio connector", () => {
 		assert.equal(classifyFailureRootCause({ spans, expectedServers: ["calendar"] }), "discovery_miss");
 		assert.equal(classifyFailureRootCause({ spans, payloadOverflowDetected: true }), "payload_overflow");
 		assert.equal(classifyFailureRootCause({ spans }), "model_reasoning");
+		assert.equal(
+			classifyFailureRootCause({
+				spans: [
+					{
+						id: "b1",
+						traceId: "t2",
+						name: "jehee.mcp.call",
+						startedMs: 1,
+						endedMs: 2,
+						attributes: { server: "mail", tool: "mail.send", "gate.action": "block", is_error: true },
+						events: [],
+						links: [],
+						status: { status: "error", error: { name: "blocked", message: "blocked" } },
+					},
+				],
+			}),
+			"boundary_violation",
+		);
+		assert.equal(
+			classifyFailureRootCause({
+				spans: [
+					{
+						id: "v1",
+						traceId: "t3",
+						name: "jehee.mcp.call",
+						startedMs: 1,
+						endedMs: 2,
+						attributes: {
+							server: "calendar",
+							tool: "calendar.import_ics",
+							"mcp.status": "stale_version",
+							is_error: true,
+						},
+						events: [],
+						links: [],
+						status: { status: "ok" },
+					},
+				],
+			}),
+			"arg_or_version_error",
+		);
 	});
 
 	it("connects to a real child-process stdio MCP server via node-stdio helper", async () => {
@@ -271,6 +312,67 @@ describe("MCP blob vault, metric dictionary, and stdio connector", () => {
 		const readSpan = trace.spans.find((s) => s.name === "jehee.mcp.resource_read");
 		assert.ok(readSpan);
 		assert.equal(readSpan.attributes.server, "mail");
+		assert.equal(readSpan.attributes["blob.offloaded"], true);
+	});
+
+	it("discovers and invokes the MCP resource triad cleanly in default deferred mode via tool_search", async () => {
+		const paleEnv = createMockPaleEnvironment({ pdfSizeBytes: 8_192, distractorServerCount: 0 });
+		const recorder = new JeheeTraceRecorder();
+		const faux = fauxProvider();
+		const models = createModels();
+		models.setProvider(faux.provider);
+
+		let capturedDeferredRead = "";
+		faux.setResponses([
+			() =>
+				fauxAssistantMessage([fauxToolCall("tool_search", { query: "mcp resource" })], { stopReason: "toolUse" }),
+			() =>
+				fauxAssistantMessage(
+					[
+						fauxToolCall(LIST_MCP_RESOURCES_TOOL, { server: "mail" }),
+						fauxToolCall(READ_MCP_RESOURCE_TOOL, { server: "mail", uri: "pale://demo/mail/assets/att-pdf" }),
+					],
+					{ stopReason: "toolUse" },
+				),
+			(ctx) => {
+				const texts = ctx.messages
+					.filter((m) => m.role === "toolResult")
+					.flatMap((m) => m.content.filter((b) => b.type === "text").map((b) => b.text));
+				capturedDeferredRead = texts.at(-1) ?? "";
+				return fauxAssistantMessage("已通过 tool_search 按需检索并读取邮件 PDF 资源。");
+			},
+		]);
+
+		const host = await JeheeHost.open(
+			{
+				storage: { kind: "memory" },
+				models,
+				defaultModel: { provider: "faux", modelId: faux.getModel().id },
+				telemetry: recorder.telemetry,
+				mcp: {
+					servers: [paleEnv.mailSpec],
+					exposure: "deferred",
+					blobOffloadThresholdBytes: 4_096,
+				},
+			},
+			BACKGROUND_CONTEXT,
+		);
+
+		try {
+			await host.sendMessage({ text: "按需查找资源工具并读取邮件附件资源" }, BACKGROUND_CONTEXT);
+			await host.waitForIdle(BACKGROUND_CONTEXT);
+		} finally {
+			await host.close(BACKGROUND_CONTEXT);
+		}
+
+		const parsedRead = JSON.parse(capturedDeferredRead) as { base64: string; sha256: string };
+		assert.ok(parsedRead.base64.startsWith(JEHEE_BLOB_HANDLE_PREFIX));
+		assert.equal(parsedRead.sha256, paleEnv.expectedPdfSha256);
+
+		const trace = await recorder.latestTrace();
+		assert.ok(trace);
+		const readSpan = trace.spans.find((s) => s.name === "jehee.mcp.resource_read");
+		assert.ok(readSpan);
 		assert.equal(readSpan.attributes["blob.offloaded"], true);
 	});
 

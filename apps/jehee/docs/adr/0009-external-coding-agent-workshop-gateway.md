@@ -98,13 +98,14 @@ apps/jehee/
 ## 5. 风险、权衡与验收标准（Verification & Risks）
 
 ### 5.1 风险与缓冲
-- **`.jehee-workshop` 状态目录污染 Git 工作区**：后台作业需在 Worktree 内写 `.pid` / `.stdout` / `.exit` 状态文件；若直接散落在根目录会被 `git status` 误报为未跟踪源码。解决方案：统一写入 `<cwd>/.jehee-workshop/`，在创建 Git Worktree 时自动向该工作树专属 exclude（或 `git status` 过滤逻辑）排除 `.jehee-workshop/`，保证仓库 `git status` 100% 干净。
+- **`.jehee-workshop` 状态目录污染 Git 工作区**：后台作业需在 Worktree 内写 `.pid` / `.stdout` / `.exit` 状态文件；若直接散落在根目录会被 `git status` 误报为未跟踪源码。解决方案：统一写入 `<cwd>/.jehee-workshop/`，在创建本地 Git Worktree 时通过 `git rev-parse --git-path info/exclude` 写入排除项，并在 `buildGitSummaryBlock` 中同步做二次过滤，保证仓库原生 `git status` 与验收回执均 100% 干净。
 - **Windows `.cmd` 包装脚本残留子进程**：Windows 上 npm 全局安装的 `opencode.cmd` / `pi.cmd` 会多套一层 `cmd.exe`；`LocalWorktreeBackend.stopJob` 统一调用 `taskkill /pid <pid> /T /F` 按进程树清理，杜绝孤儿进程。
 
-### 5.2 Slice 5B 验收门禁清单
-- [x] `npm run check`（Biome + `tsc --noEmit` + `check-worker-bundle`）零错误通过，且 `src/workshop/node-local-backend.ts` 绝不进入 Cloudflare Worker 产物。
-- [x] 单元测试（`test/coding-agent-gateway.test.ts`）覆盖：`pi` / `opencode` / `antigravity` / `claude` / `codex` / `custom` 首轮与 `--continue` 参数构造、输出截断、InstaBox 后台脚本组装，以及真实本地 Git 仓库 Worktree 创建/清理与 `.jehee-workshop` 隔离。
+### 5.2 Slice 5B 验收门禁清单（补充复核记录见 [Audit-0002](../evals/0002-adr-0006-to-0009-gate-audit-and-postmortem.md)）
+- [x] `npm run check`（Biome + `tsc --noEmit` + `check-worker-bundle`）零错误通过（Worker 产物 `1861.6 KiB`），且 `node:sqlite`、`node:child_process`、`src/workshop/node-local-backend.ts` 绝不进入 Cloudflare Worker 产物。
+- [x] 单元测试（`test/coding-agent-gateway.test.ts`）覆盖：`pi` / `opencode` / `antigravity` / `claude` / `codex` / `custom` 首轮、`--continue` 与会话 ID 恢复参数构造、输出截断、InstaBox 后台脚本组装，以及真实本地 Git 仓库 Worktree 创建、原生 `git status` 对 `.jehee-workshop` 隔离、`stopJob` 终止子进程与清理。
 - [x] Cucumber BDD（`features/coding-agent-gateway.feature`）端到端验证：
   1. 在真实本地 Git 仓库上通过 `workshop(spawn)` 驱动外部 CLI 创建分支修改文件：首轮注入 L1 Core 编码偏好、不泄漏主对话闲聊、轮询完成后向主会话回推包含真实 `git diff --stat` 的精简回执；
   2. 对同一工坊任务调用 `workshop(send)` 触发 `--continue` 会话续接，在同一 Worktree 分支上增量修改文件并二次汇报；
-  3. 支持同场并行指定不同驱动（如任务 A 指定 `antigravity`、任务 B 指定 `opencode`），且对慢速运行中的外部 CLI 调用 `workshop(stop)` 可按 PID 立即终止进程树。
+  3. 支持同场并行指定不同驱动（如任务 A 指定 `antigravity`、任务 B 指定 `opencode`），且对慢速运行中的外部 CLI 调用 `workshop(stop)` 可按 PID 立即终止进程树；
+  4. 外部 CLI 运行中调用 `workshop(send)` 支持 `followUp: true` 排队接续与 `followUp: false` 停旧启新。

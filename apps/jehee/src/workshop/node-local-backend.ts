@@ -112,23 +112,39 @@ function spawnCrossPlatform(
 	});
 }
 
-function killChildTree(pid: number | undefined, child?: ChildProcess): void {
+async function killChildTree(pid: number | undefined, child?: ChildProcess): Promise<void> {
 	if (pid === undefined || pid <= 0) return;
+	const waitForChildClose =
+		child !== undefined && child.exitCode === null && child.signalCode === null
+			? new Promise<void>((resolveClose) => {
+					const timer = setTimeout(resolveClose, 2_000);
+					child.once("close", () => {
+						clearTimeout(timer);
+						resolveClose();
+					});
+				})
+			: Promise.resolve();
+
 	if (process.platform === "win32") {
-		spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on(
-			"error",
-			() => {},
-		);
+		await new Promise<void>((resolveKill) => {
+			const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+				stdio: "ignore",
+				windowsHide: true,
+			});
+			killer.once("error", () => resolveKill());
+			killer.once("close", () => resolveKill());
+		});
+		await waitForChildClose;
 		return;
 	}
 	try {
 		process.kill(-pid, "SIGTERM");
-		return;
 	} catch {
 		try {
 			child?.kill("SIGTERM");
 		} catch {}
 	}
+	await waitForChildClose;
 }
 
 async function runShortCommand(
@@ -197,7 +213,28 @@ export class LocalWorktreeBackend implements WorkshopExecutionBackend {
 		if (res.exitCode !== 0) {
 			throw new Error(`Failed to create local git worktree at "${cwd}": ${res.stderr || res.stdout}`);
 		}
+		await this.#ensureExcludeEntry(cwd);
 		return { machineId: "local", cwd, repoPath, branchName };
+	}
+
+	async #ensureExcludeEntry(worktreeCwd: string): Promise<void> {
+		const excludePathRes = await runShortCommand(
+			["git", "-C", worktreeCwd, "rev-parse", "--git-path", "info/exclude"],
+			worktreeCwd,
+			this.#baseEnv,
+		);
+		if (excludePathRes.exitCode !== 0) return;
+		const rawPath = excludePathRes.stdout.trim();
+		if (rawPath.length === 0) return;
+		const excludeFile = isAbsolute(rawPath) ? rawPath : resolve(worktreeCwd, rawPath);
+		await mkdir(dirname(excludeFile), { recursive: true });
+		const existing = await readFile(excludeFile, "utf8").catch(() => "");
+		const entries = existing.split(/\r?\n/).map((line) => line.trim());
+		if (entries.includes(WORKSHOP_META_DIR) || entries.includes(`${WORKSHOP_META_DIR}/`)) {
+			return;
+		}
+		const sep = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+		await writeFile(excludeFile, `${existing}${sep}${WORKSHOP_META_DIR}/\n`, "utf8");
 	}
 
 	async cleanupWorkspace(workspace: ProvisionedWorkspace): Promise<void> {
@@ -208,11 +245,11 @@ export class LocalWorktreeBackend implements WorkshopExecutionBackend {
 				this.#baseEnv,
 			);
 			if (res.exitCode !== 0 && existsSync(workspace.cwd)) {
-				await rm(workspace.cwd, { recursive: true, force: true });
+				await rm(workspace.cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 			}
 			return;
 		}
-		await rm(workspace.cwd, { recursive: true, force: true });
+		await rm(workspace.cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	}
 
 	async startJob(workspace: ProvisionedWorkspace, request: StartWorkshopJobRequest): Promise<StartedWorkshopJob> {
@@ -307,11 +344,11 @@ export class LocalWorktreeBackend implements WorkshopExecutionBackend {
 
 	async stopJob(workspace: ProvisionedWorkspace, job: StartedWorkshopJob): Promise<void> {
 		const inMemory = this.#activeJobs.get(job.jobId);
-		killChildTree(job.pid ?? inMemory?.child.pid, inMemory?.child);
-		const jobDir = join(workspace.cwd, WORKSHOP_META_DIR, job.jobId);
 		if (inMemory !== undefined && inMemory.settled === undefined) {
 			inMemory.settled = { state: "finished", exitCode: 143, stdout: "", stderr: "Stopped by owner." };
 		}
+		await killChildTree(job.pid ?? inMemory?.child.pid, inMemory?.child);
+		const jobDir = join(workspace.cwd, WORKSHOP_META_DIR, job.jobId);
 		await mkdir(jobDir, { recursive: true }).catch(() => undefined);
 		await writeFile(join(jobDir, "exit.code"), "143", "utf8").catch(() => undefined);
 	}

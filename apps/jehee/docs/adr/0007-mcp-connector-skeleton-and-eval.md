@@ -155,9 +155,9 @@ export type JeheeMcpOptions = {
 1. **依赖门禁与打包体积**：`apps/jehee/package.json` 新增同仓内部依赖 `"@earendil-works/pi-mcp": "1.5.2"`，需同步更新 `package-lock.json`（若需要）并通过 `check-worker-bundle.ts` 校验——同时在 `check-worker-bundle.ts` 中显式禁止 `node:child_process` 与 `cross-spawn` 进入 Worker 产物。
 2. **Base64 误判防护**：`blob-vault.ts` 仅对明确匹配附件结构（含 `base64` / `blob` 字段且非纯文本 MIME）或超长合法 Base64 二进制块启用句柄替换，对 `text/calendar`（ICS）、`text/plain`、`application/json` 自动解码或保留可读文本，避免遮挡模型需要阅读的正文信息。
 
-### 5.2 Slice 4 验收门禁清单（已全部达成，详见 [Eval-0001 评测与失败复盘报告](../evals/0001-mcp-exposure-and-blob-postmortem.md)）
-- [x] `npm run check`（Biome + `tsc --noEmit` + `check-worker-bundle`）零错误通过，且 Worker 包（`1863.8 KiB`）不含 `node:sqlite`、`stdio.ts` 与 `cross-spawn`。
-- [x] 资源工具三件套（`list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource`）与 `jehee.mcp.resource_read` 子 Span 完整对齐并通过单测验证。
+### 5.2 Slice 4 验收门禁清单（已全部达成，详见 [Eval-0001](../evals/0001-mcp-exposure-and-blob-postmortem.md) 与 [Audit-0002](../evals/0002-adr-0006-to-0009-gate-audit-and-postmortem.md)）
+- [x] `npm run check`（Biome + `tsc --noEmit` + `check-worker-bundle`）零错误通过，且 Worker 包（经 `Audit-0002` `platform: "browser"` 加固后为 `1861.6 KiB`）不含保留的 `node:sqlite`、`node:child_process`、`stdio.ts` 与 `cross-spawn`。
+- [x] 资源工具三件套（`list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource`）与 `jehee.mcp.resource_read` 子 Span 完整对齐，并在 `eager` 与默认 `deferred + tool_search` 双模式下通过单测验证（含五类失败根因分类器全 5 桶测试）。
 - [x] Cucumber BDD（`features/mcp-connector.feature`）通过确定性内存/本地传输验证：
   1. 同时挂载多个 MCP 实例时，`deferred` 模式初始仅展示 `mcp_servers` 摘要，模型通过 `tool_search` 按需加载目标工具并完成调用；
   2. PALE 风格的乐观锁冲突（`stale_version` 含 `current_version`）完整透传给模型，模型可读取最新版本号在下一轮成功提交；

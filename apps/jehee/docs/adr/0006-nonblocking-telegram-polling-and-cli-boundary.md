@@ -92,4 +92,4 @@ export class ChannelGateway {
   1. **跨批轮询连发防抖合并**：模拟两次连续 `pollTelegramUpdatesOnce` 在防抖窗口内拉取两句短消息，首轮立即返回不阻塞，最终合并为 1 次模型调用并投递 1 条回复；
   2. **轮询期间慢工具实时 `steer` 插话**：首轮 `pollTelegramUpdatesOnce` 触发慢工具后立即返回 `offset`，慢工具未结束时第二轮 `pollTelegramUpdatesOnce` 拉取补充要求并触发 `steer`，最终仅投递 1 条合并后的回复；
   3. **轮询期间慢工具实时 `/stop` 紧急中止**：首轮触发慢工具阻塞期间，第二轮 `pollTelegramUpdatesOnce` 拉取 `/stop` 立即掐停在途任务并回执“已停止当前在途任务。”。
-- [x] `test/telegram.test.ts` 补充防抖期内 `/stop` 拦截与 `AbortSignal` 中断轮询单测，全量单测与 BDD 门禁全绿。
+- [x] `test/telegram.test.ts` 补充防抖期内 `/stop` 拦截、`AbortSignal` 中断轮询、`callback_query` 非阻塞入站及 `runTelegramPollingDaemon` 异常重试与停机单测，全量单测与 BDD 门禁全绿（详见 [Audit-0002](../evals/0002-adr-0006-to-0009-gate-audit-and-postmortem.md)）。

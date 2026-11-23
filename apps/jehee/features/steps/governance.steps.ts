@@ -6,8 +6,11 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Given, Then, When } from "@cucumber/cucumber";
+import { awaitWithContext } from "@earendil-works/chord/context";
 import type { FauxResponseStep, TranscriptContext } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { defineExtension, defineTool } from "@earendil-works/pi-durable";
+import { obj } from "@earendil-works/pi-schema";
 import type { ChannelInlineButton } from "../../src/channels/contract.ts";
 import { ChannelGateway, type IngestResult } from "../../src/channels/gateway.ts";
 import { JeheeHost } from "../../src/core/host.ts";
@@ -578,5 +581,380 @@ Then(
 		assert.ok(newMsgs[0]?.text.includes("alpha") && newMsgs[0]?.text.includes("beta"));
 		assert.ok(newMsgs[1]?.text.includes(expectedMorningWord), `Expected reply second, got: ${newMsgs[1]?.text}`);
 		assert.equal(this.gateway.heldProactiveCount, expectedHeld);
+	},
+);
+
+let modelCallsBeforeCancel = 0;
+let slowBusyBaselineTgCount = 0;
+
+Given(
+	"已在本地 SQLite 开启 {string} 与豁免规则 {string} 挂载邮件及日历 MCP",
+	async function (this: JeheeWorld, gateMode: string, exemptRule: string) {
+		govPaleEnv = createMockPaleEnvironment({ distractorServerCount: 0, calendarInitialRevision: 1 });
+		tgCaptured = [];
+		callbackToasts = [];
+		latestTicketId = "";
+		this.tempDir = await mkdtemp(join(tmpdir(), "jehee-bdd-gov-exempt-"));
+		this.sqlitePath = join(this.tempDir, "gov-exempt.sqlite");
+
+		const router: FauxResponseStep = (ctx) => {
+			const lastRole = ctx.messages.at(-1)?.role;
+			const lastUser = latestUserText(ctx);
+
+			if (lastUser.includes("先执行日历导入")) {
+				if (lastRole === "user") {
+					return fauxAssistantMessage(
+						[
+							fauxToolCall("mcp__calendar__calendar_import_ics", {
+								text: govPaleEnv.icsText,
+								expected_version: { epoch: 1, revision: 1 },
+								request_id: "exempt-ics-1",
+							}),
+							fauxToolCall("mcp__mail__mail_send", {
+								id: "msg-draft-1",
+								expected_version: { epoch: 1, revision: 0 },
+								request_id: "send-gated-1",
+							}),
+						],
+						{ stopReason: "toolUse" },
+					);
+				}
+				return fauxAssistantMessage("日历已导入；外发邮件等待你的确认。");
+			}
+
+			if (lastRole === "user") {
+				const count = toolResultTexts(ctx).length;
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("mcp__mail__mail_send", {
+							id: "msg-draft-1",
+							expected_version: { epoch: 1, revision: 0 },
+							request_id: `send-resume-${count + 1}`,
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			}
+			const newest = toolResultTexts(ctx).at(-1) ?? "";
+			if (newest.includes("confirmation_required")) {
+				return fauxAssistantMessage("已拦截等待确认。");
+			}
+			return fauxAssistantMessage("已在重启后完成已批准邮件发送。");
+		};
+		this.faux.setResponses(Array.from({ length: 12 }, () => router));
+
+		this.host = await openNodeJeheeHost(
+			{
+				sqlitePath: this.sqlitePath,
+				models: this.models,
+				defaultModel: { provider: "faux", modelId: this.faux.getModel().id },
+				mcp: {
+					servers: [govPaleEnv.mailSpec, govPaleEnv.calendarSpec],
+					exposure: "eager",
+					writeGate: {
+						mode: gateMode === "confirm-writes" ? "confirm-writes" : "off",
+						exemptTools: [exemptRule],
+					},
+				},
+			},
+			this.ctx,
+		);
+		this.gateway = new ChannelGateway({ host: this.host, allowFrom: { telegram: ["tg-owner-1"] } });
+		attachMockTelegram(this.gateway);
+	},
+);
+
+When(
+	"主人 {string} 在会话 {string} 先执行日历导入再发送草稿 {string}",
+	async function (this: JeheeWorld, senderId: string, chatId: string, _draftId: string) {
+		assert.ok(this.gateway && this.host);
+		await this.gateway.ingest(
+			{
+				channel: "telegram",
+				chatId,
+				senderId,
+				messageId: "m-exempt-and-send",
+				text: "先执行日历导入再把草稿 msg-draft-1 发出去",
+				timestampMs: Date.now(),
+			},
+			this.ctx,
+		);
+		const pending = await this.host.listPendingApprovals(this.ctx);
+		assert.equal(pending.length, 1);
+		latestTicketId = pending[0]!.id;
+	},
+);
+
+Then(
+	"日历导入因命中豁免规则免批直通（日历事件数为 {int}），而发信被拦截生成待批票据（外发邮件数为 {int}）",
+	(expectedEvents: number, expectedMailSent: number) => {
+		const snap = govPaleEnv.snapshot();
+		assert.equal(snap.calendarEvents.length, expectedEvents);
+		assert.equal(snap.mailSentIds.length, expectedMailSent);
+	},
+);
+
+When("主人点击确认卡片上的 Telegram 取消按钮作废该票据", async function (this: JeheeWorld) {
+	assert.ok(this.gateway);
+	modelCallsBeforeCancel = this.faux.state.callCount;
+	await this.gateway.ingestCallback(
+		{
+			channel: "telegram",
+			chatId: "chat-504",
+			senderId: "tg-owner-1",
+			callbackId: "cb-cancel-1",
+			messageId: "101",
+			data: `apv:no:${latestTicketId}`,
+			timestampMs: Date.now(),
+		},
+		this.ctx,
+	);
+});
+
+Then(
+	"票据被立即作废且未调用模型（待批数归 {int}，外发邮件数仍为 {int}）",
+	async function (this: JeheeWorld, expectedPending: number, expectedMailSent: number) {
+		assert.ok(this.host);
+		assert.equal(this.faux.state.callCount, modelCallsBeforeCancel);
+		assert.equal((await this.host.listPendingApprovals(this.ctx)).length, expectedPending);
+		assert.equal(govPaleEnv.snapshot().mailSentIds.length, expectedMailSent);
+		assert.ok(callbackToasts.some((t) => t.includes("已取消")));
+	},
+);
+
+When(
+	"主人重新发起发送草稿 {string} 并在网关后台批准后不立即续跑，随后重启 SQLite 宿主进程",
+	async function (this: JeheeWorld, _draftId: string) {
+		assert.ok(this.host && this.gateway && this.sqlitePath);
+		await this.gateway.ingest(
+			{
+				channel: "telegram",
+				chatId: "chat-504",
+				senderId: "tg-owner-1",
+				messageId: "m-retrigger-send",
+				text: "重新请求发送草稿",
+				timestampMs: Date.now(),
+			},
+			this.ctx,
+		);
+		const pending = await this.host.listPendingApprovals(this.ctx);
+		assert.equal(pending.length, 1);
+		const approvedRes = await this.host.resolveApproval(
+			{ ticketId: pending[0]!.id, decision: "approve", resumeOnApprove: false },
+			this.ctx,
+		);
+		assert.equal(approvedRes.kind, "approved");
+
+		this.gateway.dispose();
+		await this.host.close(this.ctx);
+
+		const postRestartApprovedRouter: FauxResponseStep = (ctx) => {
+			if (ctx.messages.at(-1)?.role === "user") {
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("mcp__mail__mail_send", {
+							id: "msg-draft-1",
+							expected_version: { epoch: 1, revision: 0 },
+							request_id: "send-after-restart-approved",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			}
+			return fauxAssistantMessage("持久化已批准票据已在重启后自动放行完成发信。");
+		};
+		this.faux.setResponses([postRestartApprovedRouter, postRestartApprovedRouter]);
+
+		this.host = await openNodeJeheeHost(
+			{
+				sqlitePath: this.sqlitePath,
+				models: this.models,
+				defaultModel: { provider: "faux", modelId: this.faux.getModel().id },
+				mcp: {
+					servers: [govPaleEnv.mailSpec, govPaleEnv.calendarSpec],
+					exposure: "eager",
+					writeGate: {
+						mode: "confirm-writes",
+						exemptTools: ["calendar/calendar.import_ics"],
+					},
+				},
+			},
+			this.ctx,
+		);
+		this.gateway = new ChannelGateway({ host: this.host, allowFrom: { telegram: ["tg-owner-1"] } });
+		attachMockTelegram(this.gateway);
+	},
+);
+
+When("重启后主人在会话 {string} 发送 {string}", async function (this: JeheeWorld, chatId: string, text: string) {
+	assert.ok(this.gateway);
+	await this.gateway.ingest(
+		{
+			channel: "telegram",
+			chatId,
+			senderId: "tg-owner-1",
+			messageId: "m-post-restart-continue",
+			text,
+			timestampMs: Date.now(),
+		},
+		this.ctx,
+	);
+});
+
+Then(
+	"持久化在 SQLite 中的已批准票据跨越重启自动放行并消费，邮件 {string} 成功发出（外发邮件数为 {int}）",
+	(expectedMailId: string, expectedSent: number) => {
+		const snap = govPaleEnv.snapshot();
+		assert.equal(snap.mailSentIds.length, expectedSent);
+		assert.equal(snap.mailSentIds[0], expectedMailId);
+	},
+);
+
+Given(
+	"已启动挂载可控慢工具 {string} 与 {int} 秒冷却窗口的渠道网关（授权主人 {string}）",
+	async function (this: JeheeWorld, slowToolName: string, cooldownSec: number, ownerId: string) {
+		tgCaptured = [];
+		fakeClockMs = Date.parse("2026-11-18T04:00:00Z"); // 12:00 Beijing time (daytime)
+		let markEntered!: () => void;
+		this.toolEntered = new Promise<void>((resolve) => {
+			markEntered = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			this.releaseSlowTool = resolve;
+		});
+		const slowTool = defineTool({
+			name: slowToolName,
+			description: "Slow foreground tool for testing busy_yield",
+			parameters: obj({}),
+			execute: async (_args, _api, toolCtx) => {
+				markEntered();
+				await awaitWithContext(gate, toolCtx);
+				return { output: [{ type: "text", text: "slow task done" }] };
+			},
+		});
+		this.customExtensions = [defineExtension({ name: `test.gov-slow.${slowToolName}`, tools: [slowTool] })];
+		this.faux.setResponses([
+			fauxAssistantMessage([fauxToolCall(slowToolName, {})], { stopReason: "toolUse" }),
+			fauxAssistantMessage("前台慢任务已结束。"),
+		]);
+
+		this.host = await JeheeHost.open(
+			{
+				storage: { kind: "memory" },
+				models: this.models,
+				defaultModel: { provider: "faux", modelId: this.faux.getModel().id },
+				extensions: this.customExtensions,
+				now: () => fakeClockMs,
+			},
+			this.ctx,
+		);
+		this.gateway = new ChannelGateway({
+			host: this.host,
+			allowFrom: { telegram: [ownerId] },
+			quietPolicy: { minIntervalMs: cooldownSec * 1000, yieldWhenBusy: true },
+			now: () => fakeClockMs,
+		});
+		attachMockTelegram(this.gateway);
+	},
+);
+
+let pendingForegroundTurn!: Promise<unknown>;
+
+When(
+	"主人先在会话 {string} 触发慢工具执行，在主会话忙碌期间后台尝试推送 {string}",
+	async function (this: JeheeWorld, chatId: string, proactiveText: string) {
+		assert.ok(this.gateway && this.toolEntered);
+		slowBusyBaselineTgCount = tgCaptured.length;
+		const admitted = await this.gateway.admit(
+			{
+				channel: "telegram",
+				chatId,
+				senderId: "tg-owner-1",
+				messageId: "m-slow-start",
+				text: "跑一个慢任务",
+				timestampMs: fakeClockMs,
+			},
+			this.ctx,
+		);
+		pendingForegroundTurn = admitted.settled;
+		await this.toolEntered;
+
+		await this.gateway.pushMessage({ channel: "telegram", chatId }, proactiveText);
+	},
+);
+
+Then(
+	"该推送因忙时让路被暂存（Telegram 当前未打扰，暂存数为 {int}）",
+	function (this: JeheeWorld, expectedHeld: number) {
+		assert.ok(this.gateway);
+		assert.equal(tgCaptured.length, slowBusyBaselineTgCount);
+		assert.equal(this.gateway.heldProactiveCount, expectedHeld);
+	},
+);
+
+When("释放慢工具完成前台回合后，主人主动发送 {string}", async function (this: JeheeWorld, flushCmd: string) {
+	assert.ok(this.releaseSlowTool && this.gateway);
+	this.releaseSlowTool();
+	this.releaseSlowTool = undefined;
+	await pendingForegroundTurn;
+	await this.gateway.drain();
+	baselineTgCount = tgCaptured.length;
+	await this.gateway.ingest(
+		{
+			channel: "telegram",
+			chatId: "chat-505",
+			senderId: "tg-owner-1",
+			messageId: "m-flush-busy",
+			text: flushCmd,
+			timestampMs: fakeClockMs,
+		},
+		this.ctx,
+	);
+});
+
+Then(
+	"Telegram 会话 {string} 立即收到包含 {string} 的补发通知（暂存数归 {int}）",
+	function (this: JeheeWorld, chatId: string, expectedText: string, expectedHeld: number) {
+		assert.ok(this.gateway);
+		const newlySent = tgCaptured.slice(baselineTgCount).filter((m) => m.chatId === chatId);
+		assert.ok(
+			newlySent.some((m) => m.text.includes(expectedText)),
+			`Missing "${expectedText}" in ${JSON.stringify(newlySent)}`,
+		);
+		assert.equal(this.gateway.heldProactiveCount, expectedHeld);
+	},
+);
+
+When(
+	"冷却窗口内 {int} 秒后后台再次主动推送 {string}",
+	async function (this: JeheeWorld, deltaSec: number, text: string) {
+		assert.ok(this.gateway);
+		fakeClockMs += deltaSec * 1000;
+		baselineTgCount = tgCaptured.length;
+		await this.gateway.pushMessage({ channel: "telegram", chatId: "chat-505" }, text);
+	},
+);
+
+Then(
+	"该推送因频控冷却被暂存（暂存数为 {int}），再次发送 {string} 后立即收到 {string}（暂存数归 {int}）",
+	async function (this: JeheeWorld, heldBefore: number, flushCmd: string, expectedText: string, heldAfter: number) {
+		assert.ok(this.gateway);
+		assert.equal(tgCaptured.length, baselineTgCount);
+		assert.equal(this.gateway.heldProactiveCount, heldBefore);
+
+		await this.gateway.ingest(
+			{
+				channel: "telegram",
+				chatId: "chat-505",
+				senderId: "tg-owner-1",
+				messageId: "m-flush-cooldown",
+				text: flushCmd,
+				timestampMs: fakeClockMs,
+			},
+			this.ctx,
+		);
+		const newlySent = tgCaptured.slice(baselineTgCount);
+		assert.ok(newlySent.some((m) => m.text.includes(expectedText)));
+		assert.equal(this.gateway.heldProactiveCount, heldAfter);
 	},
 );

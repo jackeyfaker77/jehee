@@ -471,3 +471,161 @@ Then(
 		assert.ok(lastStatusToolOutput.includes(expectedIdle), `Expected "${expectedIdle}" in: ${lastStatusToolOutput}`);
 	},
 );
+
+let controllableJobArgvs: Array<readonly string[]> = [];
+let controllableStoppedJobIds: string[] = [];
+let controllableJobReleaseByIndex = new Map<number, boolean>();
+let controllableJobSeq = 0;
+
+Given("已挂载支持可控完结与记录重启的模拟外部 CLI 后端", async function (this: JeheeWorld) {
+	controllableJobArgvs = [];
+	controllableStoppedJobIds = [];
+	controllableJobReleaseByIndex = new Map();
+	controllableJobSeq = 0;
+	const jobIndexById = new Map<string, number>();
+
+	const controllableBackend: WorkshopExecutionBackend = {
+		kind: "instabox",
+		prepareWorkspace: async (req: ProvisionWorkspaceRequest): Promise<ProvisionedWorkspace> => ({
+			machineId: "m_ctrl",
+			cwd: `/data/jehee/worktrees/${req.taskName}`,
+			repoPath: "/data/repo",
+			branchName: `jehee/${req.taskName}`,
+		}),
+		cleanupWorkspace: async () => undefined,
+		startJob: async (_ws: ProvisionedWorkspace, req: StartWorkshopJobRequest): Promise<StartedWorkshopJob> => {
+			controllableJobSeq += 1;
+			jobIndexById.set(req.jobId, controllableJobSeq);
+			controllableJobArgvs.push(req.argv);
+			return { jobId: req.jobId, pid: 8000 + controllableJobSeq };
+		},
+		pollJob: async (_ws: ProvisionedWorkspace, job: StartedWorkshopJob): Promise<WorkshopJobPollResult> => {
+			const idx = jobIndexById.get(job.jobId) ?? 0;
+			if (controllableJobReleaseByIndex.get(idx) === true) {
+				return { state: "finished", exitCode: 0, stdout: `job-${idx}-done`, stderr: "" };
+			}
+			return { state: "running" };
+		},
+		stopJob: async (_ws: ProvisionedWorkspace, job: StartedWorkshopJob): Promise<void> => {
+			controllableStoppedJobIds.push(job.jobId);
+		},
+		inspectGitSummary: async (ws: ProvisionedWorkspace) =>
+			`[git verification | branch=${ws.branchName}]\nworking tree clean`,
+	};
+
+	const router: FauxResponseStep = (ctx) => {
+		const last = latestNonSystemText(ctx);
+		if (last.role === "toolResult") {
+			return fauxAssistantMessage(`Ack: ${last.text}`);
+		}
+		if (last.text.includes("启动慢工坊")) {
+			return fauxAssistantMessage(
+				[
+					fauxToolCall("workshop", {
+						action: "spawn",
+						name: "refactor-srv",
+						driver: "pi",
+						message: "重构服务端路由",
+					}),
+				],
+				{ stopReason: "toolUse" },
+			);
+		}
+		if (last.text.includes("追问")) {
+			return fauxAssistantMessage(
+				[
+					fauxToolCall("workshop", {
+						action: "send",
+						name: "refactor-srv",
+						message: "补写回归测试",
+						followUp: true,
+					}),
+				],
+				{ stopReason: "toolUse" },
+			);
+		}
+		if (last.text.includes("纠偏")) {
+			return fauxAssistantMessage(
+				[
+					fauxToolCall("workshop", {
+						action: "send",
+						name: "refactor-srv",
+						message: "改为使用 vitest",
+						followUp: false,
+					}),
+				],
+				{ stopReason: "toolUse" },
+			);
+		}
+		return fauxAssistantMessage("工坊轮次已汇总。");
+	};
+	this.faux.setResponses(Array.from({ length: 16 }, () => router));
+
+	this.host = await JeheeHost.open(
+		{
+			storage: { kind: "memory" },
+			models: this.models,
+			defaultModel: { provider: "faux", modelId: this.faux.getModel().id },
+			workshop: {
+				backend: controllableBackend,
+				defaultDriver: "pi",
+				pollIntervalMs: 30,
+			},
+		},
+		this.ctx,
+	);
+});
+
+When(
+	"主会话派生慢速外部工坊 {string} 并在其运行中发送 followUp 追问 {string}",
+	async function (this: JeheeWorld, _name: string, followText: string) {
+		assert.ok(this.host);
+		await this.host.sendMessage({ text: "启动慢工坊" }, this.ctx);
+		for (let i = 0; i < 30 && controllableJobArgvs.length < 1; i++) {
+			await new Promise((r) => setTimeout(r, 15));
+		}
+		await this.host.sendMessage({ text: `追问：${followText}` }, this.ctx);
+	},
+);
+
+Then("该追问被排队等待当前轮完成，原进程未被提前终止", () => {
+	assert.equal(controllableJobArgvs.length, 1);
+	assert.equal(controllableStoppedJobIds.length, 0);
+});
+
+When(
+	"放行 {string} 首轮完工后，排队的续聊指令自动携带 {string} 启动第 2 轮",
+	async (_name: string, expectedFlag: string) => {
+		controllableJobReleaseByIndex.set(1, true);
+		for (let i = 0; i < 60 && controllableJobArgvs.length < 2; i++) {
+			await new Promise((r) => setTimeout(r, 20));
+		}
+		assert.equal(controllableJobArgvs.length, 2);
+		assert.ok(
+			controllableJobArgvs[1]!.includes(expectedFlag),
+			`Expected ${expectedFlag} in round 2 argv: ${JSON.stringify(controllableJobArgvs[1])}`,
+		);
+		// Allow `WorkshopCliRunner.start` transaction to commit `entry.activeJob` before round 2 steer cancellation.
+		await new Promise((r) => setTimeout(r, 50));
+	},
+);
+
+When("在第 2 轮运行期间发送非 followUp 纠偏 {string}", async function (this: JeheeWorld, steerText: string) {
+	assert.ok(this.host);
+	await this.host.sendMessage({ text: `纠偏：${steerText}` }, this.ctx);
+	for (let i = 0; i < 40 && controllableJobArgvs.length < 3; i++) {
+		await new Promise((r) => setTimeout(r, 20));
+	}
+});
+
+Then(
+	"后端立即终止第 2 轮进程并以 {string} 启动第 3 轮，所有轮次均完成汇总",
+	async function (this: JeheeWorld, expectedFlag: string) {
+		assert.ok(this.host);
+		assert.equal(controllableStoppedJobIds.length, 1);
+		assert.equal(controllableJobArgvs.length, 3);
+		assert.ok(controllableJobArgvs[2]!.includes(expectedFlag));
+		controllableJobReleaseByIndex.set(3, true);
+		await this.host.waitForWorkshopSettled(this.ctx);
+	},
+);

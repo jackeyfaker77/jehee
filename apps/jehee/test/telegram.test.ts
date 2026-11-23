@@ -12,8 +12,10 @@ import {
 	parseTelegramUpdate,
 	pollTelegramUpdatesOnce,
 	splitTelegramText,
+	TelegramTransport,
 	verifyTelegramSecretToken,
 } from "../src/index.ts";
+import { runTelegramPollingDaemon } from "../src/runtime/node.ts";
 
 describe("telegram channel helpers", () => {
 	it("verifies webhook secret tokens in constant time", () => {
@@ -158,6 +160,117 @@ describe("telegram channel helpers", () => {
 		} finally {
 			gateway.dispose();
 			await host.close(BACKGROUND_CONTEXT);
+		}
+	});
+
+	it("admits callback_query updates non-blockingly via pollTelegramUpdatesOnce and runs daemon retry loop until aborted", async () => {
+		const faux = fauxProvider();
+		faux.setResponses([fauxAssistantMessage("daemon reply")]);
+		const models = createModels();
+		models.setProvider(faux.provider);
+
+		const host = await JeheeHost.open(
+			{
+				storage: { kind: "memory" },
+				models,
+				defaultModel: { provider: "faux", modelId: faux.getModel().id },
+			},
+			BACKGROUND_CONTEXT,
+		);
+		const sentTexts: string[] = [];
+		const answeredCallbacks: string[] = [];
+		const gateway = new ChannelGateway({ host, allowFrom: { telegram: ["owner-1"] } });
+		gateway.registerTransport(
+			new TelegramTransport({
+				botToken: "tok",
+				fetchImpl: async (input, init) => {
+					const url = String(input);
+					const body = JSON.parse(String(init?.body)) as { text?: string; callback_query_id?: string };
+					if (url.endsWith("/sendMessage") && body.text !== undefined) {
+						sentTexts.push(body.text);
+					}
+					if (url.endsWith("/answerCallbackQuery") && body.callback_query_id !== undefined) {
+						answeredCallbacks.push(body.callback_query_id);
+					}
+					return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
+				},
+			}),
+		);
+
+		try {
+			// 1. Non-blocking callback_query polling updates offset immediately.
+			const cbOffset = await pollTelegramUpdatesOnce(
+				{
+					botToken: "tok",
+					gateway,
+					fetchImpl: async () =>
+						Response.json({
+							ok: true,
+							result: [
+								{
+									update_id: 500,
+									callback_query: {
+										id: "cb-poll-1",
+										from: { id: "owner-1" },
+										message: { message_id: 12, chat: { id: "chat-1", type: "private" } },
+										data: "apv:no:missing_ticket",
+									},
+								},
+							],
+						}),
+				},
+				BACKGROUND_CONTEXT,
+			);
+			await gateway.drain();
+			assert.equal(cbOffset, 501);
+			assert.deepEqual(answeredCallbacks, ["cb-poll-1"]);
+
+			// 2. Daemon retries past transient 500 error, carries offset forward, and stops on AbortSignal.
+			const controller = new AbortController();
+			let pollCount = 0;
+			const observedOffsets: Array<number | undefined> = [];
+			await runTelegramPollingDaemon(
+				{
+					botToken: "tok",
+					gateway,
+					signal: controller.signal,
+					retryDelayMs: 5,
+					fetchImpl: async (_input, init) => {
+						pollCount += 1;
+						const body = JSON.parse(String(init?.body)) as { offset?: number };
+						observedOffsets.push(body.offset);
+						if (pollCount === 1) {
+							return new Response("upstream error", { status: 500 });
+						}
+						if (pollCount === 2) {
+							return Response.json({
+								ok: true,
+								result: [
+									{
+										update_id: 600,
+										message: {
+											message_id: 1,
+											from: { id: "owner-1" },
+											chat: { id: "chat-1", type: "private" },
+											text: "daemon ping",
+										},
+									},
+								],
+							});
+						}
+						controller.abort();
+						return Response.json({ ok: true, result: [] });
+					},
+				},
+				BACKGROUND_CONTEXT,
+			);
+			await gateway.drain();
+			assert.deepEqual(observedOffsets, [undefined, undefined, 601]);
+			assert.ok(sentTexts.includes("daemon reply"));
+		} finally {
+			gateway.dispose();
+			await host.close(BACKGROUND_CONTEXT);
+			await gateway.drain();
 		}
 	});
 });

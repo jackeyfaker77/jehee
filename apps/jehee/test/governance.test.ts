@@ -2,10 +2,15 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createModels } from "@earendil-works/pi-ai/models";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import {
+	ChannelGateway,
 	computeWriteIntentDigest,
 	isSilentReplyText,
 	isWithinQuietHours,
+	JeheeHost,
 	ProactiveNotificationGovernor,
 	parseQuietHoursWindow,
 	parseTelegramCallback,
@@ -13,6 +18,7 @@ import {
 	requiresWriteApproval,
 	TelegramTransport,
 } from "../src/index.ts";
+import { createMockPaleEnvironment } from "./fixtures/pale-mcp-fixture.ts";
 
 describe("write-approval intent digests and pattern rules", () => {
 	it("produces identical digests across varying request_id and expected_version, but distinct digests when business args change", () => {
@@ -179,5 +185,151 @@ describe("Telegram inline keyboard and callback_query helpers", () => {
 		assert.ok(calls[1]?.url.endsWith("/answerCallbackQuery"));
 		assert.equal(calls[1]?.body.callback_query_id, "cb-77");
 		assert.equal(calls[1]?.body.text, "已批准");
+	});
+});
+
+describe("ChannelGateway approval disambiguation, /reject, and /flush commands", () => {
+	it("handles ambiguous pending tickets, explicit /approve <id>, /reject without model calls, and empty /flush", async () => {
+		const paleEnv = createMockPaleEnvironment({ distractorServerCount: 0 });
+		const faux = fauxProvider();
+		faux.setResponses([
+			() =>
+				fauxAssistantMessage(
+					[
+						fauxToolCall("mcp__mail__mail_send", {
+							id: "msg-draft-1",
+							expected_version: { epoch: 1, revision: 0 },
+							request_id: "r1",
+						}),
+						fauxToolCall("mcp__mail__mail_send", {
+							id: "msg-draft-2",
+							expected_version: { epoch: 1, revision: 0 },
+							request_id: "r2",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				),
+			() => fauxAssistantMessage("两项发信均已排队待确认。"),
+			() =>
+				fauxAssistantMessage(
+					[
+						fauxToolCall("mcp__mail__mail_send", {
+							id: "msg-draft-1",
+							expected_version: { epoch: 1, revision: 0 },
+							request_id: "r1-exec",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				),
+			() => fauxAssistantMessage("已发送 msg-draft-1。"),
+		]);
+		const models = createModels();
+		models.setProvider(faux.provider);
+
+		const host = await JeheeHost.open(
+			{
+				storage: { kind: "memory" },
+				models,
+				defaultModel: { provider: "faux", modelId: faux.getModel().id },
+				mcp: {
+					servers: [paleEnv.mailSpec],
+					exposure: "eager",
+					writeGate: { mode: "confirm-writes" },
+				},
+			},
+			BACKGROUND_CONTEXT,
+		);
+		const outbound: string[] = [];
+		const gateway = new ChannelGateway({
+			host,
+			allowFrom: { telegram: ["owner-1"] },
+		});
+		gateway.registerTransport({
+			channel: "telegram",
+			sendText: async (_chatId, text) => {
+				outbound.push(text);
+			},
+		});
+
+		try {
+			await gateway.ingest(
+				{
+					channel: "telegram",
+					chatId: "chat-gov-unit",
+					senderId: "owner-1",
+					messageId: "m-1",
+					text: "发两封邮件",
+					timestampMs: Date.now(),
+				},
+				BACKGROUND_CONTEXT,
+			);
+			const pending = await host.listPendingApprovals(BACKGROUND_CONTEXT);
+			assert.equal(pending.length, 2);
+			const callsBeforeCommands = faux.state.callCount;
+
+			// Ambiguous `/approve` without ID prompts for explicit ticket ID with zero model calls.
+			await gateway.ingest(
+				{
+					channel: "telegram",
+					chatId: "chat-gov-unit",
+					senderId: "owner-1",
+					messageId: "m-ambig",
+					text: "/approve",
+					timestampMs: Date.now(),
+				},
+				BACKGROUND_CONTEXT,
+			);
+			assert.equal(faux.state.callCount, callsBeforeCommands);
+			assert.ok(outbound.at(-1)?.includes("请指定编号"));
+
+			// `/reject <secondId>` cancels the second ticket with zero model calls.
+			const secondId = pending[1]!.id;
+			await gateway.ingest(
+				{
+					channel: "telegram",
+					chatId: "chat-gov-unit",
+					senderId: "owner-1",
+					messageId: "m-reject",
+					text: `/reject ${secondId}`,
+					timestampMs: Date.now(),
+				},
+				BACKGROUND_CONTEXT,
+			);
+			assert.equal(faux.state.callCount, callsBeforeCommands);
+			assert.ok(outbound.at(-1)?.includes(`已取消待确认写操作 ${secondId}`));
+			assert.equal((await host.listPendingApprovals(BACKGROUND_CONTEXT)).length, 1);
+
+			// `/approve` now resolves the sole remaining ticket and sends msg-draft-1.
+			await gateway.ingest(
+				{
+					channel: "telegram",
+					chatId: "chat-gov-unit",
+					senderId: "owner-1",
+					messageId: "m-approve-rem",
+					text: "/approve",
+					timestampMs: Date.now(),
+				},
+				BACKGROUND_CONTEXT,
+			);
+			assert.deepEqual(paleEnv.snapshot().mailSentIds, ["msg-draft-1"]);
+
+			// `/flush` with empty queue replies deterministically.
+			await gateway.ingest(
+				{
+					channel: "telegram",
+					chatId: "chat-gov-unit",
+					senderId: "owner-1",
+					messageId: "m-flush-empty",
+					text: "/flush",
+					timestampMs: Date.now(),
+				},
+				BACKGROUND_CONTEXT,
+			);
+			assert.ok(outbound.at(-1)?.includes("当前没有暂存通知"));
+		} finally {
+			gateway.dispose();
+			await host.close(BACKGROUND_CONTEXT);
+			await gateway.drain();
+		}
 	});
 });

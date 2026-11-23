@@ -101,13 +101,43 @@ describe("CodingAgentDriver argv presets and prompt isolation", () => {
 		assert.deepEqual(
 			buildCodingAgentArgv({
 				driver: "claude",
+				prompt: "Init auth",
+				cwd: "/wt/c",
+				isContinuation: false,
+				model: "claude-sonnet-4-6",
+			}),
+			["claude", "--print", "--dangerously-skip-permissions", "--model", "claude-sonnet-4-6", "--", "Init auth"],
+		);
+		assert.deepEqual(
+			buildCodingAgentArgv({
+				driver: "claude",
 				prompt: "Audit auth",
 				cwd: "/wt/c",
 				isContinuation: true,
 			}),
 			["claude", "--continue", "--print", "--dangerously-skip-permissions", "--", "Audit auth"],
 		);
+		assert.deepEqual(
+			buildCodingAgentArgv({
+				driver: "claude",
+				prompt: "Resume specific",
+				cwd: "/wt/c",
+				isContinuation: true,
+				externalSessionId: "sess-123",
+			}),
+			["claude", "--resume", "sess-123", "--print", "--dangerously-skip-permissions", "--", "Resume specific"],
+		);
 
+		assert.deepEqual(
+			buildCodingAgentArgv({
+				driver: "codex",
+				prompt: "Init schema",
+				cwd: "/wt/d",
+				isContinuation: false,
+				model: "gpt-5-codex",
+			}),
+			["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5-codex", "--", "Init schema"],
+		);
 		assert.deepEqual(
 			buildCodingAgentArgv({
 				driver: "codex",
@@ -118,6 +148,19 @@ describe("CodingAgentDriver argv presets and prompt isolation", () => {
 			["codex", "exec", "resume", "--last", "--dangerously-bypass-approvals-and-sandbox", "--", "Update schema"],
 		);
 
+		assert.deepEqual(
+			buildCodingAgentArgv({
+				driver: "custom",
+				prompt: "Init custom",
+				cwd: "/wt/custom",
+				isContinuation: false,
+				customTemplate: {
+					initialArgv: ["my-agent", "run", "--cwd", "{cwd}"],
+					continueArgv: ["my-agent", "continue", "--cwd", "{cwd}", "{prompt}"],
+				},
+			}),
+			["my-agent", "run", "--cwd", "/wt/custom", "Init custom"],
+		);
 		assert.deepEqual(
 			buildCodingAgentArgv({
 				driver: "custom",
@@ -285,10 +328,30 @@ describe("InstaBoxWorkshopBackend and LocalWorktreeBackend", () => {
 				assert.ok(poll.stdout.includes("Updated hello.txt successfully."));
 			}
 
+			const rawGitStatus = execFileSync("git", ["-C", ws.cwd, "status", "--short"], { encoding: "utf8" });
+			assert.equal(
+				rawGitStatus.trim(),
+				"M hello.txt",
+				`Raw git status should exclude .jehee-workshop, got: ${rawGitStatus}`,
+			);
+
 			const summary = await backend.inspectGitSummary(ws);
 			assert.ok(summary?.includes("branch=jehee/local-fix"));
 			assert.ok(summary?.includes("M hello.txt"));
 			assert.ok(!summary?.includes(".jehee-workshop"));
+
+			// Verify real `stopJob` terminates a live child process tree inside the local worktree.
+			const slowJob = await backend.startJob(ws, {
+				jobId: "job-local-slow",
+				argv: [process.execPath, "-e", "setInterval(() => {}, 1000);"],
+			});
+			assert.equal((await backend.pollJob(ws, slowJob)).state, "running");
+			await backend.stopJob(ws, slowJob);
+			const stoppedPoll = await backend.pollJob(ws, slowJob);
+			assert.equal(stoppedPoll.state, "finished");
+			if (stoppedPoll.state === "finished") {
+				assert.equal(stoppedPoll.exitCode, 143);
+			}
 
 			await backend.cleanupWorkspace(ws);
 		} finally {

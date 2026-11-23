@@ -25,3 +25,11 @@ Feature: 工坊双执行面外部 Coding Agent 网关（External Coding Agent Wo
     Then 后端分别收到了 "agy --print --dangerously-skip-permissions" 与 "opencode run --auto" 的隔离启动命令
     When 在慢速工坊 "api-oc" 仍在运行期间主会话调用 "stop" 终止 "api-oc"
     Then 后端收到了针对 "api-oc" 进程 PID 的终止指令，且工坊状态查询显示 "api-oc: idle"
+
+  Scenario: 外部 CLI 运行中 send 支持 followUp 排队接续与 steer 立即停旧启新
+    Given 已挂载支持可控完结与记录重启的模拟外部 CLI 后端
+    When 主会话派生慢速外部工坊 "refactor-srv" 并在其运行中发送 followUp 追问 "补写回归测试"
+    Then 该追问被排队等待当前轮完成，原进程未被提前终止
+    When 放行 "refactor-srv" 首轮完工后，排队的续聊指令自动携带 "--continue" 启动第 2 轮
+    And 在第 2 轮运行期间发送非 followUp 纠偏 "改为使用 vitest"
+    Then 后端立即终止第 2 轮进程并以 "--continue" 启动第 3 轮，所有轮次均完成汇总
