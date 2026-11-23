@@ -121,6 +121,97 @@ export function startJeheeMcpSpan(
 	return createTypedSpanStarter(telemetry, [JEHEE_MCP_TELEMETRY_SCHEMA]);
 }
 
+/** Telemetry span vocabulary emitted by Jehee's atomic memory tools underneath `pi.tool` spans. */
+export const JEHEE_MEMORY_TELEMETRY_SCHEMA = defineTelemetrySchema({
+	version: 1,
+	spans: {
+		"jehee.memory.save": {
+			description: "One atomic memory save/update transaction against MemoryDoc.",
+			parents: { kind: "any" },
+			startAttributes: {
+				"memory.kind": {
+					type: "string",
+					required: true,
+					description: "Target memory kind (core/fact/episode/active).",
+				},
+			},
+			endAttributes: {
+				"memory.id": { type: "string", description: "Assigned or updated memory ID." },
+				"memory.created": { type: "boolean", description: "Whether a new memory item was created." },
+				"memory.outcome": { type: "string", description: "Result status (ok / error reason)." },
+			},
+			status: {
+				default: "ok",
+				errorWhen: "Validation failure or core character limit exceeded.",
+			},
+		},
+		"jehee.memory.search": {
+			description: "One on-demand atomic memory search against MemoryDoc.",
+			parents: { kind: "any" },
+			startAttributes: {
+				"memory.kind": { type: "string", required: false, description: "Optional kind filter." },
+			},
+			endAttributes: {
+				"memory.hit_count": { type: "number", description: "Number of active memories returned." },
+			},
+			status: {
+				default: "ok",
+				errorWhen: "Unexpected storage read failure.",
+			},
+		},
+		"jehee.memory.forget": {
+			description: "One atomic memory soft-delete (tombstone) transaction against MemoryDoc.",
+			parents: { kind: "any" },
+			startAttributes: {
+				"memory.id": { type: "string", required: true, description: "Target memory ID to forget." },
+			},
+			endAttributes: {
+				"memory.outcome": { type: "string", description: "Result status (ok / already_forgotten / not_found)." },
+			},
+			status: {
+				default: "ok",
+				errorWhen: "Target memory ID not found.",
+			},
+		},
+		"jehee.memory.consolidate": {
+			description: "One background or manual incremental memory consolidation pass (extract, merge, supersede).",
+			parents: { kind: "any" },
+			startAttributes: {
+				"memory.trigger": {
+					type: "string",
+					required: true,
+					values: ["idle", "manual"],
+					description: "What triggered this consolidation run.",
+				},
+			},
+			endAttributes: {
+				"memory.turns_scanned": {
+					type: "number",
+					description: "Count of incremental user dialogue turns scanned.",
+				},
+				"memory.added": { type: "number", description: "Count of new atomic memories added." },
+				"memory.updated": { type: "number", description: "Count of existing memories updated." },
+				"memory.merged": { type: "number", description: "Count of duplicate memories merged and tombstoned." },
+				"memory.superseded": { type: "number", description: "Count of conflicting memories superseded." },
+				"memory.forgotten": { type: "number", description: "Count of negated memories forgotten." },
+				"memory.skipped": { type: "number", description: "Count of ops skipped by deterministic guardrails." },
+				"memory.outcome": { type: "string", description: "Outcome status (ok / noop / error)." },
+			},
+			status: {
+				default: "ok",
+				errorWhen: "Consolidation model unavailable, returned invalid JSON, or failed.",
+			},
+		},
+	},
+});
+
+/** Bound typed span starter for Jehee atomic memory spans. */
+export function startJeheeMemorySpan(
+	telemetry: TelemetryContext,
+): TypedSpanStarter<readonly [typeof JEHEE_MEMORY_TELEMETRY_SCHEMA]> {
+	return createTypedSpanStarter(telemetry, [JEHEE_MEMORY_TELEMETRY_SCHEMA]);
+}
+
 function numAttr(span: StoredSpan, key: string): number {
 	const val = span.attributes[key];
 	return typeof val === "number" && Number.isFinite(val) ? val : 0;

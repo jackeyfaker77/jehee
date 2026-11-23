@@ -20,6 +20,7 @@ import {
 	type Storage,
 	type Submission,
 	type SubmissionId,
+	type TaskId,
 	UsageDoc,
 	UserEntry,
 	type Wake,
@@ -34,8 +35,31 @@ import {
 import type { JeheeMcpOptions } from "../mcp/contract.ts";
 import { createMcpBundle } from "../mcp/extension.ts";
 import { McpConnectorHub } from "../mcp/hub.ts";
-import { createMemoryExtension } from "../memory/bridge.ts";
-import { extractAssistantText, extractUserText, type MemoryProvider } from "../memory/contract.ts";
+import { createEmptyMemoryStoreState } from "../memory/atomic-memory.ts";
+import {
+	createMemoryConsolidatorTask,
+	createMemoryExtension,
+	createMemoryToolsExtension,
+	executeMemoryConsolidation,
+	type MemoryConsolidatorTaskToken,
+	scheduleIdleConsolidationInTx,
+} from "../memory/bridge.ts";
+import { createEmptyConsolidationState } from "../memory/consolidator.ts";
+import {
+	extractAssistantText,
+	extractUserText,
+	type MemoryConsolidationReport,
+	type MemoryConsolidationState,
+	type MemoryForgetResult,
+	type MemoryInspectSnapshot,
+	type MemoryProvider,
+	type MemoryRestoreResult,
+	type MemorySaveInput,
+	type MemorySaveResult,
+	type MemorySearchHit,
+	type MemorySearchQuery,
+} from "../memory/contract.ts";
+import { MemoryConsolidationDoc, MemoryDoc } from "../memory/durable-store.ts";
 import type { WorkshopExecutionBackend } from "../workshop/backend.ts";
 import type { CustomCodingAgentTemplate, WorkshopDriverName } from "../workshop/coding-agent-driver.ts";
 import { createWorkshopBundle, type WorkshopBundle, WorkshopRegistryDoc } from "../workshop/extension.ts";
@@ -134,22 +158,61 @@ export type ResolveApprovalResult =
 	  }
 	| { readonly kind: "rejected"; readonly ticket: ApprovalTicket };
 
+/** Outcome of inspecting the currently mounted memory provider on `JeheeHost`. */
+export type InspectMemoryResult =
+	| {
+			readonly kind: "atomic";
+			readonly snapshot: MemoryInspectSnapshot;
+			readonly consolidation: MemoryConsolidationState;
+	  }
+	| { readonly kind: "static"; readonly providerId: string; readonly corePrompt?: string };
+
+/** Outcome of searching memories on `JeheeHost`. */
+export type SearchMemoryResult =
+	| { readonly kind: "atomic"; readonly hits: readonly MemorySearchHit[] }
+	| { readonly kind: "unsupported"; readonly providerId: string };
+
+/** Outcome of saving a memory item via `JeheeHost`. */
+export type HostMemorySaveResult =
+	| MemorySaveResult
+	| { readonly ok: false; readonly reason: "unsupported"; readonly message: string };
+
+/** Outcome of forgetting a memory item via `JeheeHost`. */
+export type HostMemoryForgetResult =
+	| MemoryForgetResult
+	| { readonly ok: false; readonly reason: "unsupported"; readonly id: string };
+
+/** Outcome of restoring a forgotten memory item via `JeheeHost`. */
+export type HostMemoryRestoreResult =
+	| MemoryRestoreResult
+	| { readonly ok: false; readonly reason: "unsupported"; readonly message: string };
+
 /** Always-on personal colleague host wrapping a durable Session and its root conversation. */
 export class JeheeHost {
 	readonly #harness: Harness;
 	readonly #registry: Registry;
 	readonly #root: Conversation;
+	readonly #models: Models;
+	readonly #defaultModel: ModelRef;
+	readonly #telemetry: TelemetryContext | undefined;
 	readonly #proactiveListeners: Set<ProactiveReplyListener>;
 	readonly #approvalListeners: Set<ApprovalRequestListener>;
 	readonly #mcpHub: McpConnectorHub | undefined;
 	readonly #now: () => number;
 	readonly #memoryHolder: { current: MemoryProvider | undefined };
+	readonly #consolidatorTask: MemoryConsolidatorTaskToken;
+	readonly #onRootTurnCompleted: (conversationId: ConversationId, context: Context) => Promise<void>;
 
 	private constructor(
 		harness: Harness,
 		registry: Registry,
 		root: Conversation,
+		models: Models,
+		defaultModel: ModelRef,
+		telemetry: TelemetryContext | undefined,
 		memoryHolder: { current: MemoryProvider | undefined },
+		consolidatorTask: MemoryConsolidatorTaskToken,
+		onRootTurnCompleted: (conversationId: ConversationId, context: Context) => Promise<void>,
 		proactiveListeners: Set<ProactiveReplyListener>,
 		approvalListeners: Set<ApprovalRequestListener>,
 		mcpHub: McpConnectorHub | undefined,
@@ -158,7 +221,12 @@ export class JeheeHost {
 		this.#harness = harness;
 		this.#registry = registry;
 		this.#root = root;
+		this.#models = models;
+		this.#defaultModel = defaultModel;
+		this.#telemetry = telemetry;
 		this.#memoryHolder = memoryHolder;
+		this.#consolidatorTask = consolidatorTask;
+		this.#onRootTurnCompleted = onRootTurnCompleted;
 		this.#proactiveListeners = proactiveListeners;
 		this.#approvalListeners = approvalListeners;
 		this.#mcpHub = mcpHub;
@@ -172,11 +240,33 @@ export class JeheeHost {
 		const proactiveListeners = new Set<ProactiveReplyListener>();
 		const approvalListeners = new Set<ApprovalRequestListener>();
 		const nowFn = options.now ?? Date.now;
+		const memoryHolder: { current: MemoryProvider | undefined } = { current: options.memory };
+		const consolidatorTask = createMemoryConsolidatorTask({
+			getAtomic: () => memoryHolder.current?.atomic,
+			defaultModel: options.defaultModel,
+			...(options.telemetry !== undefined ? { telemetry: options.telemetry } : {}),
+		});
+		let harnessRef: Harness | undefined;
+		let rootRef: Conversation | undefined;
+		const onRootTurnCompleted = async (conversationId: ConversationId, hookCtx: Context): Promise<void> => {
+			if (rootRef === undefined || conversationId !== rootRef.id) return;
+			const atomic = memoryHolder.current?.atomic;
+			if (atomic === undefined) return;
+			const idleDelayMs = atomic.consolidation.idleDelayMs;
+			if (idleDelayMs <= 0) return;
+			await rootRef.commit(
+				(tx) => scheduleIdleConsolidationInTx(tx, consolidatorTask, nowFn(), idleDelayMs),
+				hookCtx,
+			);
+		};
 		for (const ext of options.extensions ?? []) {
 			registry.install(ext);
 		}
 		if (options.memory !== undefined) {
-			registry.install(createMemoryExtension(options.memory));
+			registry.install(createMemoryExtension(options.memory, { onRootTurnCompleted }));
+			registry.install(createMemoryToolsExtension(options.memory, consolidatorTask));
+		} else {
+			registry.install(createMemoryToolsExtension(undefined, consolidatorTask));
 		}
 		let mcpHub: McpConnectorHub | undefined;
 		if (options.mcp !== undefined) {
@@ -197,7 +287,6 @@ export class JeheeHost {
 				registry.install(ext);
 			}
 		}
-		const memoryHolder: { current: MemoryProvider | undefined } = { current: options.memory };
 		let workshopBundle: WorkshopBundle | undefined;
 		if (options.workshop !== undefined) {
 			workshopBundle = createWorkshopBundle({
@@ -212,7 +301,15 @@ export class JeheeHost {
 				...(options.workshop.pollIntervalMs !== undefined
 					? { pollIntervalMs: options.workshop.pollIntervalMs }
 					: {}),
-				getCorePrompt: (convId) => memoryHolder.current?.renderCorePrompt?.(convId),
+				getCorePrompt: async (convId) => {
+					const current = memoryHolder.current;
+					if (current === undefined) return undefined;
+					if (current.atomic !== undefined && harnessRef !== undefined) {
+						const doc = (await harnessRef.snapshot(MemoryDoc, context)) ?? createEmptyMemoryStoreState();
+						return current.atomic.renderCoreFromState(doc);
+					}
+					return current.renderCorePrompt?.(convId);
+				},
 				onProactiveReply: async (replyText, answerEntryId) => {
 					for (const listener of proactiveListeners) {
 						await listener(replyText, answerEntryId);
@@ -241,6 +338,7 @@ export class JeheeHost {
 				},
 				context,
 			);
+			harnessRef = harness;
 			const removedOnRoot =
 				workshopBundle?.sandboxExtension !== undefined ? [workshopBundle.sandboxExtension] : undefined;
 			const root = await harness.root(context, {
@@ -251,6 +349,7 @@ export class JeheeHost {
 					...(removedOnRoot !== undefined ? { extensions: { remove: removedOnRoot } } : {}),
 				},
 			});
+			rootRef = root;
 			await root.configure(
 				{
 					model: options.defaultModel,
@@ -265,7 +364,12 @@ export class JeheeHost {
 				harness,
 				registry,
 				root,
+				options.models,
+				options.defaultModel,
+				options.telemetry,
 				memoryHolder,
+				consolidatorTask,
+				onRootTurnCompleted,
 				proactiveListeners,
 				approvalListeners,
 				mcpHub,
@@ -305,7 +409,117 @@ export class JeheeHost {
 	/** Hot-swaps the active MemoryProvider in place without dropping conversation history or restarting the host. */
 	setMemoryProvider(provider: MemoryProvider): void {
 		this.#memoryHolder.current = provider;
-		this.#registry.install(createMemoryExtension(provider));
+		this.#registry.install(createMemoryExtension(provider, { onRootTurnCompleted: this.#onRootTurnCompleted }));
+		this.#registry.install(createMemoryToolsExtension(provider, this.#consolidatorTask));
+	}
+
+	/** Inspects the currently mounted memory provider deterministically without invoking an LLM. */
+	async inspectMemory(context: Context, recentLimit?: number): Promise<InspectMemoryResult> {
+		const provider = this.#memoryHolder.current;
+		if (provider?.atomic !== undefined) {
+			const doc = (await this.#harness.snapshot(MemoryDoc, context)) ?? createEmptyMemoryStoreState();
+			const consolidation =
+				(await this.#harness.snapshot(MemoryConsolidationDoc, context)) ?? createEmptyConsolidationState();
+			return { kind: "atomic", snapshot: provider.atomic.inspect(doc, recentLimit), consolidation };
+		}
+		const corePrompt = await provider?.renderCorePrompt?.(String(this.#root.id));
+		return {
+			kind: "static",
+			providerId: provider?.id ?? "none",
+			...(corePrompt !== undefined ? { corePrompt } : {}),
+		};
+	}
+
+	/** Reads the persisted memory consolidation watermark and cumulative counters. */
+	async getMemoryConsolidationState(context: Context): Promise<MemoryConsolidationState> {
+		return (await this.#harness.snapshot(MemoryConsolidationDoc, context)) ?? createEmptyConsolidationState();
+	}
+
+	/** Runs one incremental memory consolidation pass immediately (manual trigger). */
+	async consolidateMemory(
+		context: Context,
+		options?: { readonly force?: boolean },
+	): Promise<MemoryConsolidationReport> {
+		const atomic = this.#memoryHolder.current?.atomic;
+		if (atomic === undefined) {
+			return { status: "noop", trigger: "manual", reason: "unsupported", turnsScanned: 0 };
+		}
+		return executeMemoryConsolidation(
+			{
+				trigger: "manual",
+				...(options?.force !== undefined ? { force: options.force } : {}),
+				conversationId: this.#root.id,
+				atomic,
+				models: this.#models,
+				defaultModel: this.#defaultModel,
+				now: this.#now,
+				...(this.#telemetry !== undefined ? { telemetry: this.#telemetry } : {}),
+				commit: (change, ctx) => this.#root.commit(change, ctx),
+			},
+			context,
+		);
+	}
+
+	/** Waits until any currently scheduled background idle memory consolidation task has settled. */
+	async waitForMemoryConsolidation(context: Context): Promise<void> {
+		const state = await this.#harness.snapshot(MemoryConsolidationDoc, context);
+		if (state?.scheduledTaskId !== undefined) {
+			await this.#harness.waitForTask(state.scheduledTaskId as TaskId<null>, context);
+		}
+	}
+
+	/** Searches active atomic memories deterministically without invoking an LLM. */
+	async searchMemory(query: MemorySearchQuery, context: Context): Promise<SearchMemoryResult> {
+		const provider = this.#memoryHolder.current;
+		if (provider?.atomic === undefined) {
+			return { kind: "unsupported", providerId: provider?.id ?? "none" };
+		}
+		const doc = (await this.#harness.snapshot(MemoryDoc, context)) ?? createEmptyMemoryStoreState();
+		return { kind: "atomic", hits: provider.atomic.search(doc, query) };
+	}
+
+	/** Saves or updates an atomic memory item directly in `MemoryDoc`. */
+	async saveMemory(input: MemorySaveInput, context: Context): Promise<HostMemorySaveResult> {
+		const atomic = this.#memoryHolder.current?.atomic;
+		if (atomic === undefined) {
+			return {
+				ok: false,
+				reason: "unsupported",
+				message: `Current memory provider "${this.#memoryHolder.current?.id ?? "none"}" does not support atomic memory writes.`,
+			};
+		}
+		return this.#root.commit(async (tx) => {
+			const doc = await tx.doc(MemoryDoc);
+			return atomic.save(doc, input, this.#now());
+		}, context);
+	}
+
+	/** Soft-deletes an atomic memory item by ID deterministically without invoking an LLM. */
+	async forgetMemory(id: string, context: Context, reason?: string): Promise<HostMemoryForgetResult> {
+		const atomic = this.#memoryHolder.current?.atomic;
+		if (atomic === undefined) {
+			return { ok: false, reason: "unsupported", id: id.trim() };
+		}
+		return this.#root.commit(async (tx) => {
+			const doc = await tx.doc(MemoryDoc);
+			return atomic.forget(doc, id, this.#now(), reason);
+		}, context);
+	}
+
+	/** Restores a previously forgotten atomic memory item by ID deterministically. */
+	async restoreMemory(id: string, context: Context): Promise<HostMemoryRestoreResult> {
+		const atomic = this.#memoryHolder.current?.atomic;
+		if (atomic === undefined) {
+			return {
+				ok: false,
+				reason: "unsupported",
+				message: `Current memory provider "${this.#memoryHolder.current?.id ?? "none"}" does not support atomic memory restore.`,
+			};
+		}
+		return this.#root.commit(async (tx) => {
+			const doc = await tx.doc(MemoryDoc);
+			return atomic.restore(doc, id, this.#now());
+		}, context);
 	}
 
 	/** Durably admits a user message (or returns the existing submission on matching `requestId`) without blocking on completion. */

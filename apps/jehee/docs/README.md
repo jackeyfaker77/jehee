@@ -29,6 +29,8 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
    运行 Biome 格式/静态检查、TypeScript 类型检查、Worker 边缘打包纯净度检查、依赖精确锁定检查，以及 Cucumber BDD 全量验收测试。
 7. **对比评测与五类失败复盘（Comparative Eval & Failure Postmortem）**
    针对工具暴露模式、附件流转、记忆策略等存在取舍空间的部件，基于统一指标口径运行 A/B 对比实验，并将未满分样本导出完整决策树归入标准根因桶。
+8. **问题留痕与避坑归档（Mandatory Issue Traceability）**
+   每个切片在开发、门禁排查或真机实测中遇到的**所有非平凡缺陷、上游基座契约坑（如 `pi-durable` / `pi-ai` / Provider 网关约束）与评测失败轮次**，必须在切片收口前留痕归档至 `apps/jehee/docs/evals/NNNN-*-postmortem.md` 并登记到本索引，固定包含四要素：**现象与报错、根因定位、修复落点、防复发规则**。
 
 ---
 
@@ -50,6 +52,8 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [ADR-0007](./adr/0007-mcp-connector-skeleton-and-eval.md) | 双栖 MCP 连接器骨架、Trace 可观测性与暴露策略对比 Eval | Accepted | 2026-11-18 | 打通 `JeheeHost` 父子 Span 决策树与标准指标字典；基于 `@earendil-works/pi-mcp` 与 `tool_search` 构建双栖多实例 MCP 连接器、资源三工具与大附件句柄暂存，并落地 `eager` vs `deferred` 对比 Eval 与五类失败复盘。 |
 | [ADR-0008](./adr/0008-write-approval-and-quiet-governance.md) | 确定性写操作人工确认闭环与主动打扰静默门控（Slice 5A） | Accepted | 2026-11-18 | 基于 SQLite `ApprovalDoc` 与 SHA-256 业务参数指纹实现零阻塞单次写操作审批票据（打通 Telegram 内联按钮 `callback_query` 与 `/approve`、`/reject`），并落地静默时段、忙时让路、频控冷却与 `[SILENT]` 暂存治理。 |
 | [ADR-0009](./adr/0009-external-coding-agent-workshop-gateway.md) | 工坊升级为双执行面外部 Coding Agent 网关（Slice 5B） | Accepted | 2026-11-18 | 抽象跨平台 `WorkshopExecutionBackend`（云端 InstaBox + 本机 Git Worktree），内置 `pi`、`opencode`、`antigravity` (`agy`)、`claude`、`codex` 与自定义驱动器，实现后台 PID 轮询与确定性 Git Diff 验收回执。 |
+| [ADR-0010](./adr/0010-atomic-memory-and-eval.md) | 可插拔持久化原子记忆插件（L1 Core 一页纸 + 按需检索 + `/memory`）与 `Eval-0002`（Slice 5C-1） | Accepted | 2026-11-24 | 基于 `pi-durable` `MemoryDoc` 实现 100% 双栖可移植的原子记忆存储、低频 L1 Core 立即刷新、中英关键词/别名/时间检索与 `sourceEntryId` 溯源、软删除墓碑及 `/memory` 确定性指令，并规划 `Eval-0002` 对比评测。 |
+| [ADR-0011](./adr/0011-background-memory-consolidation.md) | 后台空闲/定时异步记忆整理（去重、冲突消解与隐性事实提炼）（Slice 5C-2） | Accepted | 2026-11-24 | 基于 `MemoryConsolidationDoc` 增量水位线、`pi-durable` 单活空闲休眠任务与严格 JSON Patch 校验器，实现零重复扫描的隐性事实提炼、重复合并、冲突消解（墓碑可逆恢复）及 `/memory consolidate` 确定性指令。 |
 
 ### 评测结论与失败复盘记录（Evals & Postmortems）
 
@@ -57,6 +61,7 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | :--- | :--- | :--- | :--- | :--- |
 | [Eval-0001](./evals/0001-mcp-exposure-and-blob-postmortem.md) | MCP 工具暴露策略与二进制附件句柄对比评测及失败复盘 | [ADR-0007](./adr/0007-mcp-connector-skeleton-and-eval.md) | 2026-11-18 | `opencode-go/deepseek-v4.1-flash` 真机与离线双轨实测：70 工具拓扑下默认 `deferred + $jehee_blob:` 相比基线降低 **95.2% 输入 Token**（`492,557 -> 23,648`）、**96.0% 真实账单**（`\$0.03791 -> \$0.00152`）与 **90.6% 耗时**（`342.1s -> 32.1s`），消除 20 KiB 截断诱发的思考螺旋与 `integrity_mismatch`。 |
 | [Audit-0002](./evals/0002-adr-0006-to-0009-gate-audit-and-postmortem.md) | ADR-0006 至 ADR-0009 验收门禁补齐记录与根因复盘 | [ADR-0006](./adr/0006-nonblocking-telegram-polling-and-cli-boundary.md)–[0009](./adr/0009-external-coding-agent-workshop-gateway.md) | 2026-11-24 | 补齐 06–09 轮询守护、默认 `deferred` 资源发现、`approved` 重启消费、`/reject`/`/flush`/忙时与冷却治理、6 驱动首轮参数与 `followUp`/`steer` 全量验证（`33/33` 单测、`32/32` BDD），并修复 Worker 包 `node:child_process` 残留（`1861.6 KiB`）、Windows `stopJob` `EBUSY` 竞态及 `info/exclude` 隔离。 |
+| [Eval-0002](./evals/0003-memory-provider-eval-and-postmortem.md) | 热插拔持久化原子记忆插件（`StaticCore` vs `5C-1` vs `5C-2`）双轨三臂对比评测 | [ADR-0010](./adr/0010-atomic-memory-and-eval.md)–[0011](./adr/0011-background-memory-consolidation.md) | 2026-11-24 | `opencode-go/deepseek-v4.1-flash` 真机与离线双轨实测：`StaticCore` `14.3%` -> `AtomicMemory (5C-1)` `71.4%`（离线 `57.1%`）-> `5C-2 Consolidation` `100%`（单次全程账单 `\$0.00314`、`merged=1/superseded=1/skipped=0`），并借真机修复 `opencode-go` `MissingSessionID` 与替换旧值复述问题。 |
 
 ---
 
@@ -97,4 +102,4 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 
 ## 4. 后续计划立项队列
 
-- **ADR-0010（Slice 5C）**：基于 SQLite 抽屉与全文检索的热插拔持久化记忆插件及 `Eval-0002` 对比评测。
+- **ADR-0012（Slice 5D）**：L4 历史压缩抽屉与单窗口无感换窗（Seamless Handoff）。

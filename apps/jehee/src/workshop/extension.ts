@@ -20,6 +20,7 @@ import {
 	type TaskRuntime,
 } from "@earendil-works/pi-durable";
 import { bool, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
+import { JEHEE_MEMORY_TOOLS_EXTENSION_HANDLE } from "../memory/bridge.ts";
 import { extractAssistantText } from "../memory/contract.ts";
 import { InstaBoxWorkshopBackend, type StartedWorkshopJob, type WorkshopExecutionBackend } from "./backend.ts";
 import {
@@ -556,7 +557,10 @@ export function createWorkshopBundle(options: WorkshopBundleOptions): WorkshopBu
 						const anchor = await tx.createTask(WorkshopAnchor, null, bg);
 						const child = await tx.createConversation({ ownership: { kind: "task", taskId: anchor } });
 						await configure(tx, child.id, {
-							extensions: { remove: [orchestratorExtension], add: [sandboxExtension!] },
+							extensions: {
+								remove: [orchestratorExtension, JEHEE_MEMORY_TOOLS_EXTENSION_HANDLE],
+								add: [sandboxExtension!],
+							},
 							cwd: ws.cwd,
 							instructions: `You are Jehee Workshop subagent "${name}" operating exclusively inside isolated worktree "${ws.cwd}". Complete the delegated task and return a concise factual summary.`,
 						});

@@ -30,6 +30,10 @@ export {
 	verifyTelegramSecretToken,
 } from "./channels/telegram.ts";
 export {
+	type HostMemoryForgetResult,
+	type HostMemoryRestoreResult,
+	type HostMemorySaveResult,
+	type InspectMemoryResult,
 	type JeheeHistoryItem,
 	JeheeHost,
 	type JeheeHostOptions,
@@ -41,6 +45,7 @@ export {
 	type JeheeWorkshopOptions,
 	type ProactiveReplyListener,
 	type ResolveApprovalResult,
+	type SearchMemoryResult,
 } from "./core/host.ts";
 export {
 	ApprovalDoc,
@@ -107,14 +112,77 @@ export {
 	READ_MCP_RESOURCE_TOOL,
 } from "./mcp/extension.ts";
 export { McpConnectorHub, validateMcpServerSpecs } from "./mcp/hub.ts";
-export { createMemoryExtension, JEHEE_MEMORY_EXTENSION_NAME } from "./memory/bridge.ts";
 export {
+	type AtomicMemoryOptions,
+	AtomicMemoryProvider,
+	createEmptyMemoryStoreState,
+	DEFAULT_MAX_CORE_CHARS,
+	forgetAtomicMemory,
+	formatMemoryInspectReply,
+	formatMemorySearchReply,
+	inspectAtomicMemory,
+	isMemoryKind,
+	parseMemoryProviderEnv,
+	renderCoreFromMemoryState,
+	restoreAtomicMemory,
+	saveAtomicMemory,
+	searchAtomicMemory,
+} from "./memory/atomic-memory.ts";
+export {
+	type CreateMemoryExtensionOptions,
+	createMemoryConsolidatorTask,
+	createMemoryExtension,
+	createMemoryToolsExtension,
+	executeMemoryConsolidation,
+	JEHEE_MEMORY_EXTENSION_NAME,
+	JEHEE_MEMORY_TOOLS_EXTENSION_HANDLE,
+	JEHEE_MEMORY_TOOLS_EXTENSION_NAME,
+	MEMORY_FORGET_TOOL,
+	MEMORY_SAVE_TOOL,
+	MEMORY_SEARCH_TOOL,
+	type MemoryConsolidatorTaskToken,
+	type RunMemoryConsolidationInput,
+	scheduleIdleConsolidationInTx,
+} from "./memory/bridge.ts";
+export {
+	applyConsolidationPlan,
+	buildConsolidationUserPrompt,
+	CONSOLIDATION_SYSTEM_PROMPT,
+	type ConsolidationApplyOutcome,
+	type ConsolidationDialogueTurn,
+	createEmptyConsolidationState,
+	DEFAULT_CONSOLIDATION_MIN_TURNS,
+	formatConsolidationReportReply,
+	MAX_CONSOLIDATION_OPS,
+	type ParseConsolidationPlanResult,
+	parseConsolidationPlan,
+} from "./memory/consolidator.ts";
+export {
+	type AtomicMemoryController,
+	type ConsolidationOp,
+	type ConsolidationPlan,
 	extractAssistantText,
 	extractUserText,
+	type MemoryConsolidationPolicy,
+	type MemoryConsolidationReport,
+	type MemoryConsolidationState,
+	type MemoryForgetResult,
+	type MemoryInspectSnapshot,
+	type MemoryItem,
+	type MemoryKind,
+	type MemoryModelRef,
 	type MemoryProvider,
+	type MemoryRestoreResult,
+	type MemorySaveInput,
+	type MemorySaveResult,
+	type MemorySearchHit,
+	type MemorySearchQuery,
+	type MemoryStatus,
+	type MemoryStoreState,
 	type RequestContextInput,
 	type TurnCompletedEvent,
 } from "./memory/contract.ts";
+export { MemoryConsolidationDoc, MemoryDoc } from "./memory/durable-store.ts";
 export { type StaticCoreMemoryOptions, StaticCoreMemoryProvider } from "./memory/static-core.ts";
 export { type JeheeRuntimeConfig, parseJeheeEnvConfig } from "./runtime/config.ts";
 export {
@@ -129,10 +197,12 @@ export {
 	computeTraceMetrics,
 	type FailureRootCause,
 	JEHEE_MCP_TELEMETRY_SCHEMA,
+	JEHEE_MEMORY_TELEMETRY_SCHEMA,
 	type JeheePostmortemReport,
 	type JeheeTraceMetrics,
 	JeheeTraceRecorder,
 	startJeheeMcpSpan,
+	startJeheeMemorySpan,
 } from "./telemetry/recorder.ts";
 export {
 	buildGitSummaryBlock,

@@ -9,6 +9,7 @@ import { openDurableObjectSqliteStorage } from "@earendil-works/pi-durable/stora
 import { ChannelGateway } from "./src/channels/gateway.ts";
 import { handleTelegramWebhook, TelegramTransport } from "./src/channels/telegram.ts";
 import { JeheeHost } from "./src/core/host.ts";
+import { AtomicMemoryProvider } from "./src/memory/atomic-memory.ts";
 import { StaticCoreMemoryProvider } from "./src/memory/static-core.ts";
 import { parseJeheeEnvConfig } from "./src/runtime/config.ts";
 import { createJeheeModels, type EnvDictionary } from "./src/runtime/models.ts";
@@ -22,6 +23,11 @@ export type JeheeWorkerEnv = {
 	readonly JEHEE_MODEL?: string;
 	readonly JEHEE_INSTRUCTIONS?: string;
 	readonly JEHEE_CORE_MEMORY?: string;
+	readonly JEHEE_MEMORY_PROVIDER?: string;
+	readonly JEHEE_MEMORY_CORE_MAX_CHARS?: string;
+	readonly JEHEE_MEMORY_CONSOLIDATION_IDLE_MS?: string;
+	readonly JEHEE_MEMORY_CONSOLIDATION_MIN_TURNS?: string;
+	readonly JEHEE_MEMORY_CONSOLIDATION_MODEL?: string;
 	readonly JEHEE_STAGING_ROUTES?: string;
 	readonly JEHEE_DEBOUNCE_MS?: string;
 	readonly OPENCODE_API_KEY?: string;
@@ -86,7 +92,14 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 			const config = parseJeheeEnvConfig(this.#envDict);
 			this.#webhookSecret = config.telegram?.webhookSecret;
 			const models = createJeheeModels(this.#envDict);
-			const memory = new StaticCoreMemoryProvider({ corePrompt: config.coreMemoryPrompt });
+			const memory =
+				config.memoryProvider === "atomic"
+					? new AtomicMemoryProvider({
+							seedCorePrompt: config.coreMemoryPrompt,
+							maxCoreChars: config.memoryCoreMaxChars,
+							consolidation: config.memoryConsolidation,
+						})
+					: new StaticCoreMemoryProvider({ corePrompt: config.coreMemoryPrompt });
 
 			const workshop =
 				config.instabox !== undefined

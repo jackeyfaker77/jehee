@@ -83,4 +83,5 @@
 | **Slice 4（已完成）** | **双栖 MCP 连接器骨架（`tool_search` 按需暴露 + 资源三件套 + 附件句柄 + 写门控钩子）与对比 Eval** | 支持多实例 HTTP / 本地 `stdio` MCP（对接 PALE 环境）、`list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource`、乐观锁报错透传、PDF/ICS 大附件句柄无损流转，并完成 `eager` vs `deferred` 对比评测与失败复盘归档（`Eval-0001`）。 |
 | **Slice 5A（已完成）** | **确定性安全门控与主动打扰治理（SQLite 单次审批票据 + Telegram 内联按钮确认 + 三重静默暂存门控）** | 高危 MCP 写操作生成持久化 `apv_...` 确认卡片且等待期不阻塞主对话，支持 Telegram 点按钮与 `/approve` 单次防调包放行；后台推送支持静默时段、忙时让路、冷却频控与暂存汇总交付。 |
 | **Slice 5B（已完成）** | **工坊演进为双执行面外部 Coding Agent 网关（`pi` / `opencode` / `antigravity` / `claude` / `codex`）** | 支持云端 InstaBox 与本机双 Git Worktree 隔离，通过回合制 `--print`/`--continue` 与后台 PID 轮询调度异构外部 Coding Agent CLI，并附带确定性 `git diff --stat` 验收回执。 |
-| **Slice 5C（规划中）** | **热插拔记忆插件渐进演进与 `Eval-0002` 对比评测** | 基于 SQLite 全文检索与可读核心抽屉实现持久化记忆插件，复用统一 Trace 指标字典对比 `StaticCore` 与新方案（`Eval-0002`）。 |
+| **Slice 5C-1（已完成）** | **热插拔持久化原子记忆插件（L1 Core 一页纸 + 别名/时间检索 + 软删除 + `/memory` 指令）与 `Eval-0002`** | 基于 `pi-durable` `MemoryDoc` 实现双栖持久化记忆、`memory_save`/`memory_search`/`memory_forget` 工具、`/memory` 确定性白名单指令、工坊只读隔离与 `StaticCore` vs `AtomicMemory` 对比评测（`Eval-0002`）。 |
+| **Slice 5C-2（已完成）** | **后台空闲/定时异步记忆整理（去重、冲突消解与隐性事实提炼）** | 基于 `MemoryConsolidationDoc` 增量水位线、`pi-durable` 单活空闲休眠任务、严格 JSON Patch 确定性应用器（墓碑可逆恢复）与 `/memory consolidate` 白名单指令，三臂 `Eval-0002` 对比达 `100%`（vs 5C-1 `57.1%` / 基线 `14.3%`）。 |

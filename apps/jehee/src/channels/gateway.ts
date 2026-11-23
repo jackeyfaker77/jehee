@@ -6,6 +6,8 @@ import type { Context } from "@earendil-works/chord/context";
 import type { JeheeHost, JeheePendingTurn } from "../core/host.ts";
 import type { ApprovalTicket } from "../governance/approvals.ts";
 import { ProactiveNotificationGovernor, type ProactiveQuietPolicy } from "../governance/quiet-gate.ts";
+import { formatMemoryInspectReply, formatMemorySearchReply } from "../memory/atomic-memory.ts";
+import { formatConsolidationReportReply } from "../memory/consolidator.ts";
 import {
 	type ChannelRoute,
 	type ChannelSendOptions,
@@ -32,8 +34,8 @@ export type ChannelGatewayOptions = {
 	readonly now?: () => number;
 };
 
-/**Deterministic slash commands handled directly by `ChannelGateway`. */
-export type GatewaySlashCommand = "status" | "stop" | "approve" | "reject" | "flush";
+/** Deterministic slash commands handled directly by `ChannelGateway`. */
+export type GatewaySlashCommand = "status" | "stop" | "approve" | "reject" | "flush" | "memory";
 
 /** Outcome reported after ingesting or flushing an inbound message or button callback. */
 export type IngestResult =
@@ -69,6 +71,10 @@ function parseSlashCommand(trimmed: string): { readonly cmd: GatewaySlashCommand
 	if (trimmed === "/reject" || trimmed.startsWith("/reject ")) {
 		const arg = trimmed.slice("/reject".length).trim();
 		return arg.length > 0 ? { cmd: "reject", arg } : { cmd: "reject" };
+	}
+	if (trimmed === "/memory" || trimmed.startsWith("/memory ")) {
+		const arg = trimmed.slice("/memory".length).trim();
+		return arg.length > 0 ? { cmd: "memory", arg } : { cmd: "memory" };
 	}
 	return undefined;
 }
@@ -366,6 +372,10 @@ export class ChannelGateway {
 			);
 		}
 
+		if (cmd === "memory") {
+			return this.#handleMemoryCommand(arg, message, context);
+		}
+
 		const busy = await this.#host.isBusy(context);
 		const memoryId = this.#host.memoryProvider?.id ?? "none";
 		const mcpServers = this.#host.mcpServerNames;
@@ -387,6 +397,93 @@ export class ChannelGateway {
 			replyToMessageId: message.messageId,
 		});
 		return { settled: Promise.resolve({ kind: "command_handled", command: "status" }) };
+	}
+
+	async #handleMemoryCommand(
+		arg: string | undefined,
+		message: InboundChannelMessage,
+		context: Context,
+	): Promise<AdmittedIngest> {
+		const sendOpts: ChannelSendOptions = { replyToMessageId: message.messageId };
+		const trimmed = arg?.trim() ?? "";
+
+		if (trimmed.length === 0 || trimmed === "list") {
+			const inspected = await this.#host.inspectMemory(context);
+			const reply =
+				inspected.kind === "atomic"
+					? formatMemoryInspectReply(inspected.snapshot, inspected.consolidation)
+					: `[Memory] provider=${inspected.providerId} (static)\n${inspected.corePrompt ?? "(empty)"}`;
+			await this.#deliverOutbound(message.channel, message.chatId, reply, sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
+		}
+
+		const spaceIdx = trimmed.indexOf(" ");
+		const sub = (spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx)).toLowerCase();
+		const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+
+		if (sub === "consolidate") {
+			const force = rest === "--force" || rest === "force";
+			const report = await this.#host.consolidateMemory(context, { ...(force ? { force: true } : {}) });
+			await this.#deliverOutbound(message.channel, message.chatId, formatConsolidationReportReply(report), sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
+		}
+
+		if (sub === "search") {
+			if (rest.length === 0) {
+				await this.#deliverOutbound(message.channel, message.chatId, "用法：/memory search <关键词>", sendOpts);
+				return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
+			}
+			const result = await this.#host.searchMemory({ query: rest }, context);
+			const reply =
+				result.kind === "atomic"
+					? formatMemorySearchReply(rest, result.hits)
+					: `当前记忆插件 "${result.providerId}" 不支持按需检索。`;
+			await this.#deliverOutbound(message.channel, message.chatId, reply, sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
+		}
+
+		if (sub === "forget") {
+			if (rest.length === 0) {
+				await this.#deliverOutbound(message.channel, message.chatId, "用法：/memory forget <id>", sendOpts);
+				return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
+			}
+			const result = await this.#host.forgetMemory(rest, context, "owner_command");
+			let reply: string;
+			if (result.ok) {
+				reply = result.alreadyForgotten
+					? `记忆 ${result.item.id} 已处于遗忘状态。`
+					: `已遗忘记忆 ${result.item.id}（${result.item.kind}）：${result.item.content}`;
+			} else if (result.reason === "not_found") {
+				reply = `未找到记忆 "${result.id}"。`;
+			} else {
+				reply = "当前记忆插件不支持遗忘操作。";
+			}
+			await this.#deliverOutbound(message.channel, message.chatId, reply, sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
+		}
+
+		if (sub === "restore") {
+			if (rest.length === 0) {
+				await this.#deliverOutbound(message.channel, message.chatId, "用法：/memory restore <id>", sendOpts);
+				return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
+			}
+			const result = await this.#host.restoreMemory(rest, context);
+			const reply = result.ok
+				? result.alreadyActive
+					? `记忆 ${result.item.id} 当前已是活跃状态。`
+					: `已恢复记忆 ${result.item.id}（${result.item.kind}）：${result.item.content}`
+				: `恢复失败：${result.message}`;
+			await this.#deliverOutbound(message.channel, message.chatId, reply, sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
+		}
+
+		await this.#deliverOutbound(
+			message.channel,
+			message.chatId,
+			"用法：/memory [list | search <关键词> | forget <id> | restore <id> | consolidate [--force]]",
+			sendOpts,
+		);
+		return { settled: Promise.resolve({ kind: "command_handled", command: "memory" }) };
 	}
 
 	async #resolveAndRespondApproval(

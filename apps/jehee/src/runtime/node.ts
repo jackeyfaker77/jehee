@@ -12,6 +12,7 @@ import { JeheeHost, type JeheeHostOptions } from "../core/host.ts";
 import { mergeJeheeMcpOptions, type ParsedStdioServerInput, parseMcpConfigJson } from "../mcp/config.ts";
 import type { JeheeMcpOptions } from "../mcp/contract.ts";
 import { stdioMcpServer } from "../mcp/node-stdio.ts";
+import { AtomicMemoryProvider } from "../memory/atomic-memory.ts";
 import { StaticCoreMemoryProvider } from "../memory/static-core.ts";
 import { InstaBoxWorkshopBackend } from "../workshop/backend.ts";
 import { InstaBoxClient } from "../workshop/instabox-client.ts";
@@ -133,7 +134,14 @@ export async function assembleNodeRuntime(
 		...(options.mcpConfigPath !== undefined ? { defaultConfigPath: options.mcpConfigPath } : {}),
 	});
 	const models = createJeheeModels(options.env);
-	const memory = new StaticCoreMemoryProvider({ corePrompt: config.coreMemoryPrompt });
+	const memory =
+		config.memoryProvider === "atomic"
+			? new AtomicMemoryProvider({
+					seedCorePrompt: config.coreMemoryPrompt,
+					maxCoreChars: config.memoryCoreMaxChars,
+					consolidation: config.memoryConsolidation,
+				})
+			: new StaticCoreMemoryProvider({ corePrompt: config.coreMemoryPrompt });
 
 	const sharedWorkshopOpts = {
 		...(config.workshopDriver !== undefined ? { defaultDriver: config.workshopDriver } : {}),

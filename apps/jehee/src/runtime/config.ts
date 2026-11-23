@@ -5,6 +5,9 @@ import type { WriteApprovalPolicy } from "../governance/approvals.ts";
 import { type ProactiveQuietPolicy, parseQuietHoursWindow } from "../governance/quiet-gate.ts";
 import { type ParsedStdioServerInput, parseMcpConfigJson, parseMcpExposureEnv } from "../mcp/config.ts";
 import type { JeheeMcpExposure, JeheeMcpOptions, JeheeMcpServerSpec } from "../mcp/contract.ts";
+import { DEFAULT_MAX_CORE_CHARS, parseMemoryProviderEnv } from "../memory/atomic-memory.ts";
+import { DEFAULT_CONSOLIDATION_MIN_TURNS } from "../memory/consolidator.ts";
+import type { MemoryConsolidationPolicy } from "../memory/contract.ts";
 import {
 	type CustomCodingAgentTemplate,
 	parseWorkshopDriverName,
@@ -17,6 +20,9 @@ export type JeheeRuntimeConfig = {
 	readonly defaultModel: ModelRef;
 	readonly instructions: string;
 	readonly coreMemoryPrompt: string;
+	readonly memoryProvider: "atomic" | "static";
+	readonly memoryCoreMaxChars: number;
+	readonly memoryConsolidation: MemoryConsolidationPolicy;
 	readonly telegram?: {
 		readonly botToken: string;
 		readonly webhookSecret?: string;
@@ -203,10 +209,46 @@ export function parseJeheeEnvConfig(
 				}
 			: undefined;
 
+	const memoryProvider = parseMemoryProviderEnv(env.JEHEE_MEMORY_PROVIDER) ?? "static";
+	const rawCoreMaxChars = env.JEHEE_MEMORY_CORE_MAX_CHARS?.trim();
+	const memoryCoreMaxChars =
+		rawCoreMaxChars !== undefined && rawCoreMaxChars.length > 0 ? Number(rawCoreMaxChars) : DEFAULT_MAX_CORE_CHARS;
+	if (!Number.isFinite(memoryCoreMaxChars) || memoryCoreMaxChars < 100) {
+		throw new Error(`Invalid JEHEE_MEMORY_CORE_MAX_CHARS "${rawCoreMaxChars}": must be a number >= 100`);
+	}
+
+	const rawConsolIdle = env.JEHEE_MEMORY_CONSOLIDATION_IDLE_MS?.trim();
+	const consolidationIdleMs = rawConsolIdle !== undefined && rawConsolIdle.length > 0 ? Number(rawConsolIdle) : 0;
+	if (!Number.isFinite(consolidationIdleMs) || consolidationIdleMs < 0) {
+		throw new Error(`Invalid JEHEE_MEMORY_CONSOLIDATION_IDLE_MS "${rawConsolIdle}": must be a non-negative number`);
+	}
+
+	const rawConsolMinTurns = env.JEHEE_MEMORY_CONSOLIDATION_MIN_TURNS?.trim();
+	const consolidationMinTurns =
+		rawConsolMinTurns !== undefined && rawConsolMinTurns.length > 0
+			? Number(rawConsolMinTurns)
+			: DEFAULT_CONSOLIDATION_MIN_TURNS;
+	if (!Number.isFinite(consolidationMinTurns) || consolidationMinTurns < 1) {
+		throw new Error(`Invalid JEHEE_MEMORY_CONSOLIDATION_MIN_TURNS "${rawConsolMinTurns}": must be a number >= 1`);
+	}
+
+	const rawConsolModel = env.JEHEE_MEMORY_CONSOLIDATION_MODEL?.trim();
+	const consolidationModel =
+		rawConsolModel !== undefined && rawConsolModel.length > 0 ? resolveModelSpec(rawConsolModel, models) : undefined;
+
+	const memoryConsolidation: MemoryConsolidationPolicy = {
+		idleDelayMs: Math.floor(consolidationIdleMs),
+		minNewTurns: Math.floor(consolidationMinTurns),
+		...(consolidationModel !== undefined ? { model: consolidationModel } : {}),
+	};
+
 	return {
 		defaultModel,
 		instructions: env.JEHEE_INSTRUCTIONS?.trim() || DEFAULT_JEHEE_INSTRUCTIONS,
 		coreMemoryPrompt: env.JEHEE_CORE_MEMORY?.trim() ?? "",
+		memoryProvider,
+		memoryCoreMaxChars: Math.floor(memoryCoreMaxChars),
+		memoryConsolidation,
 		...(telegram !== undefined ? { telegram } : {}),
 		stagingAllowedRoutes: splitCsv(env.JEHEE_STAGING_ROUTES),
 		debounceMs,
