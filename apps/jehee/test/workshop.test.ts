@@ -192,4 +192,16 @@ describe("workshop sandbox safety and client", () => {
 			await gateway.drain();
 		}
 	});
+
+	it("invokes fetch without binding `this` to the InstaBoxClient instance (Cloudflare Workers compatibility)", async () => {
+		async function strictFetch(this: unknown): Promise<Response> {
+			if (this !== undefined) {
+				throw new TypeError("Illegal invocation");
+			}
+			return Response.json({ id: "m_1", name: "achi", state: "running" });
+		}
+		const client = new InstaBoxClient({ apiKey: "ibk_1", fetchImpl: strictFetch });
+		const machine = await client.getMachine("achi");
+		assert.equal(machine.id, "m_1");
+	});
 });

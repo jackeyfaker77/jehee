@@ -4,7 +4,7 @@
 	"compatibility_date": "2026-10-01",
 	"compatibility_flags": ["nodejs_compat"],
 	"vars": {
-		"JEHEE_MODEL": "opencode-go/glm-5.3-flash"
+		"JEHEE_MODEL": "opencode-go/deepseek-v4.1-flash"
 	},
 	"durable_objects": {
 		"bindings": [

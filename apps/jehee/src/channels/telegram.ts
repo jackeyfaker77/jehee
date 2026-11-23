@@ -140,7 +140,12 @@ export class TelegramTransport implements ChannelTransport {
 		this.channel = options.channelName ?? "telegram";
 		const apiRoot = (options.apiBaseUrl ?? "https://api.telegram.org").replace(/\/+$/, "");
 		this.#baseUrl = `${apiRoot}/bot${options.botToken}`;
-		this.#fetch = options.fetchImpl ?? globalThis.fetch;
+		// Wrap fetch so Cloudflare Workers `globalThis.fetch` is never invoked with `TelegramTransport` as `this`.
+		const customFetch = options.fetchImpl;
+		this.#fetch =
+			customFetch !== undefined
+				? (input, init) => customFetch(input, init)
+				: (input, init) => globalThis.fetch(input, init);
 	}
 
 	/** Sends a text reply, chunking payloads past Telegram's 4096-character limit and attaching inline buttons on the final chunk. */

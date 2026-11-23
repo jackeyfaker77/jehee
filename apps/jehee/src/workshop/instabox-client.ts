@@ -84,7 +84,12 @@ export class InstaBoxClient {
 	constructor(options: InstaBoxClientOptions) {
 		this.#apiKey = options.apiKey;
 		this.#baseUrl = (options.baseUrl ?? "https://api.instabox.sh").replace(/\/+$/, "");
-		this.#fetch = options.fetchImpl ?? globalThis.fetch;
+		// Wrap fetch so Cloudflare Workers `globalThis.fetch` is never invoked with `InstaBoxClient` as `this`.
+		const customFetch = options.fetchImpl;
+		this.#fetch =
+			customFetch !== undefined
+				? (input, init) => customFetch(input, init)
+				: (input, init) => globalThis.fetch(input, init);
 		this.#waitParam = options.operationWaitParam ?? "10s";
 		this.#maxPolls = options.maxOperationPolls ?? 30;
 	}

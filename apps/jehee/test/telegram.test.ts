@@ -273,4 +273,20 @@ describe("telegram channel helpers", () => {
 			await gateway.drain();
 		}
 	});
+
+	it("invokes fetch without binding `this` to the TelegramTransport instance (Cloudflare Workers compatibility)", async () => {
+		const calls: string[] = [];
+		async function strictFetch(this: unknown, input: string | URL | Request): Promise<Response> {
+			if (this !== undefined) {
+				throw new TypeError("Illegal invocation");
+			}
+			calls.push(String(input));
+			return Response.json({ ok: true, result: true });
+		}
+		const transport = new TelegramTransport({ botToken: "tok", fetchImpl: strictFetch });
+		await transport.sendTyping("chat-1");
+		await transport.sendText("chat-1", "hello");
+		await transport.answerCallback("cb-1", "ok");
+		assert.equal(calls.length, 3);
+	});
 });

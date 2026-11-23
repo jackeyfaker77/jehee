@@ -16,4 +16,5 @@
   - `configure({ extensions: { remove } })` accepts `Extension` objects, not string names.
   - `ToolExecutionResult` uses `output` (not `content`).
   - Manual `JeheeHost` methods must fall back to the host's configured `telemetry` (`this.#telemetry ?? context.telemetry`).
+- **Cloudflare Workers `fetch` receiver**: Never store `globalThis.fetch` on a class property/private field and invoke it as `this.#fetch(...)` (`workerd` throws `TypeError: Illegal invocation`). Always wrap both `globalThis.fetch` and injected `fetchImpl` in standalone arrow calls and cover with a strict `this === undefined` unit test.
 - **Eval hygiene**: Keep eval dialogue prompts natural and realistic; never embed meta test instructions (e.g. "do not call tools") inside user messages, as downstream summarizers/consolidators will treat them as genuine user intent.
