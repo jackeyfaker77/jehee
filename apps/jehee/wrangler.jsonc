@@ -4,7 +4,9 @@
 	"compatibility_date": "2026-10-01",
 	"compatibility_flags": ["nodejs_compat"],
 	"vars": {
-		"JEHEE_MODEL": "opencode-go/deepseek-v4.1-flash"
+		"JEHEE_MODEL": "opencode-go/deepseek-v4.1-flash",
+		"JEHEE_MEMORY_PROVIDER": "atomic",
+		"JEHEE_MEMORY_CONSOLIDATION_IDLE_MS": "600000"
 	},
 	"durable_objects": {
 		"bindings": [
