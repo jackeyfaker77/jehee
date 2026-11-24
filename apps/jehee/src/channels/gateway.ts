@@ -3,6 +3,7 @@
 // governance ("It knows when to be quiet"), busy-turn steering, and cross-platform root-session continuity.
 
 import type { Context } from "@earendil-works/chord/context";
+import { formatHandoffReply } from "../context/handoff.ts";
 import type { JeheeHost, JeheePendingTurn } from "../core/host.ts";
 import type { ApprovalTicket } from "../governance/approvals.ts";
 import { ProactiveNotificationGovernor, type ProactiveQuietPolicy } from "../governance/quiet-gate.ts";
@@ -36,7 +37,7 @@ export type ChannelGatewayOptions = {
 };
 
 /** Deterministic slash commands handled directly by `ChannelGateway`. */
-export type GatewaySlashCommand = "status" | "stop" | "approve" | "reject" | "flush" | "memory";
+export type GatewaySlashCommand = "status" | "stop" | "approve" | "reject" | "flush" | "memory" | "handoff";
 
 /** Outcome reported after ingesting or flushing an inbound message or button callback. */
 export type IngestResult =
@@ -76,6 +77,10 @@ function parseSlashCommand(trimmed: string): { readonly cmd: GatewaySlashCommand
 	if (trimmed === "/memory" || trimmed.startsWith("/memory ")) {
 		const arg = trimmed.slice("/memory".length).trim();
 		return arg.length > 0 ? { cmd: "memory", arg } : { cmd: "memory" };
+	}
+	if (trimmed === "/handoff" || trimmed.startsWith("/handoff ")) {
+		const arg = trimmed.slice("/handoff".length).trim();
+		return arg.length > 0 ? { cmd: "handoff", arg } : { cmd: "handoff" };
 	}
 	return undefined;
 }
@@ -377,17 +382,30 @@ export class ChannelGateway {
 			return this.#handleMemoryCommand(arg, message, context);
 		}
 
+		if (cmd === "handoff") {
+			const report = await this.#host.handoffWindow(context, {
+				...(arg !== undefined && arg.length > 0 ? { focus: arg } : {}),
+			});
+			await this.#deliverOutbound(message.channel, message.chatId, formatHandoffReply(report), {
+				replyToMessageId: message.messageId,
+			});
+			return { settled: Promise.resolve({ kind: "command_handled", command: "handoff" }) };
+		}
+
 		const busy = await this.#host.isBusy(context);
 		const memoryId = this.#host.memoryProvider?.id ?? "none";
 		const mcpServers = this.#host.mcpServerNames;
 		const mcpLabel = mcpServers.length > 0 ? mcpServers.join(", ") : "none";
 		const pendingApprovals = await this.#host.listPendingApprovals(context);
+		const contextStatus = await this.#host.getContextStatus(context);
 		const usage = await this.#host.getUsageSummary(context);
 		const cachePct = (usage.cacheHitRate * 100).toFixed(1);
+		const sweetSpotLabel = contextStatus.sweetSpotTokens > 0 ? String(contextStatus.sweetSpotTokens) : "off";
 		const statusText = [
 			`status: ${busy ? "busy" : "idle"}`,
 			`conversation: ${String(this.#host.rootConversationId)}`,
 			`memory: ${memoryId}`,
+			`context: ${contextStatus.activeTokens}/${sweetSpotLabel} tok (handoffs=${contextStatus.totalHandoffs})`,
 			`mcp: ${mcpLabel}`,
 			`pending_approvals: ${pendingApprovals.length}`,
 			`held_proactive: ${this.#governor.heldCount}`,

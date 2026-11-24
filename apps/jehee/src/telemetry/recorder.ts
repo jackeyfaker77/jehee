@@ -254,6 +254,64 @@ export function startJeheeMemorySpan(
 	return createTypedSpanStarter(telemetry, [JEHEE_MEMORY_TELEMETRY_SCHEMA]);
 }
 
+/** Telemetry span vocabulary emitted by Jehee's Slice 5D seamless handoff and verbatim history recall layer. */
+export const JEHEE_CONTEXT_TELEMETRY_SCHEMA = defineTelemetrySchema({
+	version: 1,
+	spans: {
+		"jehee.context.handoff": {
+			description: "One seamless window handoff (manual reset brief or pre-compaction sweet-spot governance).",
+			parents: { kind: "any" },
+			startAttributes: {
+				"context.kind": {
+					type: "string",
+					required: true,
+					values: ["auto_compaction", "manual_handoff"],
+					description: "Whether this handoff is automatic sweet-spot compaction or manual /handoff reset.",
+				},
+			},
+			endAttributes: {
+				"context.tokens_before": { type: "number", description: "Estimated active tokens prior to handoff." },
+				"context.tokens_after": { type: "number", description: "Estimated active tokens after handoff." },
+				"context.consolidated_memory": {
+					type: "boolean",
+					description: "Whether Slice 5C-2 memory consolidation ran before handoff.",
+				},
+				"context.outcome": { type: "string", description: "Result status (ok / noop / error)." },
+			},
+			status: {
+				default: "ok",
+				errorWhen: "Handoff blocked because host was busy or summary generation failed.",
+			},
+		},
+		"jehee.context.history_search": {
+			description: "One verbatim transcript lookup across immutable SQLite history past compaction/reset markers.",
+			parents: { kind: "any" },
+			startAttributes: {
+				"history.mode": {
+					type: "string",
+					required: true,
+					values: ["entry", "search"],
+					description: "Lookup by exact entryId or keyword search.",
+				},
+			},
+			endAttributes: {
+				"history.hit_count": { type: "number", description: "Count of verbatim transcript records returned." },
+			},
+			status: {
+				default: "ok",
+				errorWhen: "Unexpected storage scan failure.",
+			},
+		},
+	},
+});
+
+/** Bound typed span starter for Jehee context handoff and history recall spans. */
+export function startJeheeContextSpan(
+	telemetry: TelemetryContext,
+): TypedSpanStarter<readonly [typeof JEHEE_CONTEXT_TELEMETRY_SCHEMA]> {
+	return createTypedSpanStarter(telemetry, [JEHEE_CONTEXT_TELEMETRY_SCHEMA]);
+}
+
 function numAttr(span: StoredSpan, key: string): number {
 	const val = span.attributes[key];
 	return typeof val === "number" && Number.isFinite(val) ? val : 0;

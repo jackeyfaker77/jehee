@@ -7,6 +7,7 @@ import type { AssistantMessage, Models } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
 	CompactionEntry,
+	type CompactionResult,
 	type Conversation,
 	type ConversationId,
 	type Cursor,
@@ -30,6 +31,21 @@ import {
 	type Wake,
 } from "@earendil-works/pi-durable";
 import type { TelemetryContext } from "@earendil-works/pi-telemetry";
+import { HandoffDoc } from "../context/durable-store.ts";
+import { createContextExtension, executeManualWindowHandoff, extractHistoryRecords } from "../context/extension.ts";
+import {
+	type ContextWindowStatus,
+	createEmptyHandoffState,
+	estimateActiveContextTokens,
+	type HandoffPolicy,
+	type HandoffState,
+	type HandoffWindowReport,
+	type HistoryLookupQuery,
+	type HistoryLookupResult,
+	lookupHistoryRecords,
+	resolveHandoffPolicy,
+	shouldTriggerSweetSpotCompaction,
+} from "../context/handoff.ts";
 import {
 	ApprovalDoc,
 	type ApprovalRequestListener,
@@ -101,6 +117,7 @@ export type JeheeHostOptions = {
 	readonly defaultModel: ModelRef;
 	readonly instructions?: string;
 	readonly memory?: MemoryProvider;
+	readonly handoff?: Partial<HandoffPolicy>;
 	readonly mcp?: JeheeMcpOptions;
 	readonly workshop?: JeheeWorkshopOptions;
 	readonly extensions?: readonly Extension[];
@@ -257,6 +274,8 @@ export class JeheeHost {
 	readonly #mcpHub: McpConnectorHub | undefined;
 	readonly #now: () => number;
 	readonly #memoryHolder: { current: MemoryProvider | undefined };
+	readonly #handoffPolicy: HandoffPolicy;
+	readonly #compactionTracker: { lastTaskId: TaskId<CompactionResult> | undefined };
 	readonly #consolidatorTask: MemoryConsolidatorTaskToken;
 	readonly #onRootTurnCompleted: (conversationId: ConversationId, context: Context) => Promise<void>;
 
@@ -268,6 +287,8 @@ export class JeheeHost {
 		defaultModel: ModelRef,
 		telemetry: TelemetryContext | undefined,
 		memoryHolder: { current: MemoryProvider | undefined },
+		handoffPolicy: HandoffPolicy,
+		compactionTracker: { lastTaskId: TaskId<CompactionResult> | undefined },
 		consolidatorTask: MemoryConsolidatorTaskToken,
 		onRootTurnCompleted: (conversationId: ConversationId, context: Context) => Promise<void>,
 		proactiveListeners: Set<ProactiveReplyListener>,
@@ -282,6 +303,8 @@ export class JeheeHost {
 		this.#defaultModel = defaultModel;
 		this.#telemetry = telemetry;
 		this.#memoryHolder = memoryHolder;
+		this.#handoffPolicy = handoffPolicy;
+		this.#compactionTracker = compactionTracker;
 		this.#consolidatorTask = consolidatorTask;
 		this.#onRootTurnCompleted = onRootTurnCompleted;
 		this.#proactiveListeners = proactiveListeners;
@@ -298,6 +321,8 @@ export class JeheeHost {
 		const approvalListeners = new Set<ApprovalRequestListener>();
 		const nowFn = options.now ?? Date.now;
 		const memoryHolder: { current: MemoryProvider | undefined } = { current: options.memory };
+		const handoffPolicy = resolveHandoffPolicy(options.handoff);
+		const compactionTracker: { lastTaskId: TaskId<CompactionResult> | undefined } = { lastTaskId: undefined };
 		const consolidatorTask = createMemoryConsolidatorTask({
 			getAtomic: () => memoryHolder.current?.atomic,
 			defaultModel: options.defaultModel,
@@ -305,6 +330,25 @@ export class JeheeHost {
 		});
 		let harnessRef: Harness | undefined;
 		let rootRef: Conversation | undefined;
+		const runPreHandoffConsolidation = async (hookCtx: Context): Promise<boolean> => {
+			if (rootRef === undefined) return false;
+			const atomic = memoryHolder.current?.atomic;
+			if (atomic === undefined) return false;
+			const report = await executeMemoryConsolidation(
+				{
+					trigger: "manual",
+					conversationId: rootRef.id,
+					atomic,
+					models: options.models,
+					defaultModel: options.defaultModel,
+					now: nowFn,
+					...(options.telemetry !== undefined ? { telemetry: options.telemetry } : {}),
+					commit: (change, ctx) => rootRef!.commit(change, ctx),
+				},
+				hookCtx,
+			);
+			return report.status === "ok";
+		};
 		const onRootTurnCompleted = async (conversationId: ConversationId, hookCtx: Context): Promise<void> => {
 			if (rootRef === undefined || conversationId !== rootRef.id) return;
 			const atomic = memoryHolder.current?.atomic;
@@ -316,9 +360,56 @@ export class JeheeHost {
 				hookCtx,
 			);
 		};
+		const onRootContextAfterRun = async (conversationId: ConversationId, hookCtx: Context): Promise<void> => {
+			if (rootRef === undefined || harnessRef === undefined || conversationId !== rootRef.id) return;
+			if (handoffPolicy.sweetSpotTokens <= 0) return;
+			const live = await harnessRef.snapshot(LiveDoc, rootRef.id, hookCtx);
+			const hasRunningCompaction = (live?.compactions?.length ?? 0) > 0;
+			const view = await rootRef.context(hookCtx);
+			const activeTokens = estimateActiveContextTokens(view.messages);
+			const activeDialogueTurns = view.entries.filter(
+				(entry) => UserEntry.is(entry) || AssistantEntry.is(entry),
+			).length;
+			if (
+				shouldTriggerSweetSpotCompaction({
+					activeTokens,
+					activeDialogueTurns,
+					policy: handoffPolicy,
+					hasRunningCompaction,
+				})
+			) {
+				compactionTracker.lastTaskId = await rootRef.compact(undefined, hookCtx);
+			}
+		};
 		for (const ext of options.extensions ?? []) {
 			registry.install(ext);
 		}
+		registry.install(
+			createContextExtension({
+				enableHistoryTool: options.memory?.atomic !== undefined || options.handoff !== undefined,
+				getPolicy: () => handoffPolicy,
+				getDefaultModel: () => options.defaultModel,
+				getModels: () => options.models,
+				getNow: nowFn,
+				getTelemetry: () => options.telemetry,
+				isRootConversation: (convId) => rootRef !== undefined && convId === rootRef.id,
+				runPreHandoffConsolidation,
+				recordAutoCompaction: async (metrics, hookCtx) => {
+					if (rootRef === undefined) return;
+					await rootRef.commit(async (tx) => {
+						const hDoc = await tx.doc(HandoffDoc);
+						hDoc.totalCompactions += 1;
+						hDoc.lastHandoffAtMs = nowFn();
+						hDoc.lastHandoffKind = "auto_compaction";
+						hDoc.lastTokensBefore = metrics.tokensBefore;
+						if (metrics.summaryPreview !== undefined) {
+							hDoc.lastSummaryPreview = metrics.summaryPreview;
+						}
+					}, hookCtx);
+				},
+				onRootAfterRun: onRootContextAfterRun,
+			}),
+		);
 		if (options.memory !== undefined) {
 			registry.install(createMemoryExtension(options.memory, { onRootTurnCompleted }));
 			registry.install(createMemoryToolsExtension(options.memory, consolidatorTask));
@@ -391,6 +482,10 @@ export class JeheeHost {
 					settings: {
 						followUpMode: "all",
 						steeringMode: "all",
+						compaction: {
+							enabled: handoffPolicy.sweetSpotTokens > 0,
+							keepRecentTokens: handoffPolicy.keepRecentTokens,
+						},
 					},
 				},
 				context,
@@ -425,6 +520,8 @@ export class JeheeHost {
 				options.defaultModel,
 				options.telemetry,
 				memoryHolder,
+				handoffPolicy,
+				compactionTracker,
 				consolidatorTask,
 				onRootTurnCompleted,
 				proactiveListeners,
@@ -523,6 +620,94 @@ export class JeheeHost {
 		if (state?.scheduledTaskId !== undefined) {
 			await this.#harness.waitForTask(state.scheduledTaskId as TaskId<null>, context);
 		}
+	}
+
+	/** Reads persisted Slice 5D handoff & compaction metrics from `HandoffDoc`. */
+	async getHandoffState(context: Context): Promise<HandoffState> {
+		return (await this.#harness.snapshot(HandoffDoc, context)) ?? createEmptyHandoffState();
+	}
+
+	/** Computes current active window token estimate against sweet-spot budget and persisted handoff counts. */
+	async getContextStatus(context: Context): Promise<ContextWindowStatus> {
+		const view = await this.#root.context(context);
+		const activeTokens = estimateActiveContextTokens(view.messages);
+		const handoffState = await this.getHandoffState(context);
+		return {
+			activeTokens,
+			sweetSpotTokens: this.#handoffPolicy.sweetSpotTokens,
+			keepRecentTokens: this.#handoffPolicy.keepRecentTokens,
+			activeEntries: view.entries.length,
+			totalCompactions: handoffState.totalCompactions,
+			totalManualHandoffs: handoffState.totalManualHandoffs,
+			totalHandoffs: handoffState.totalCompactions + handoffState.totalManualHandoffs,
+			...(handoffState.lastHandoffAtMs !== undefined ? { lastHandoffAtMs: handoffState.lastHandoffAtMs } : {}),
+			...(handoffState.lastHandoffKind !== undefined ? { lastHandoffKind: handoffState.lastHandoffKind } : {}),
+		};
+	}
+
+	/** Runs an explicit seamless window handoff: flushes memory consolidation, summarizes active window, and writes `ResetEntry`. */
+	async handoffWindow(context: Context, options?: { readonly focus?: string }): Promise<HandoffWindowReport> {
+		return executeManualWindowHandoff(
+			{
+				conversationId: this.#root.id,
+				...(options?.focus !== undefined ? { focus: options.focus } : {}),
+				policy: this.#handoffPolicy,
+				models: this.#models,
+				defaultModel: this.#defaultModel,
+				now: this.#now,
+				...(this.#telemetry !== undefined ? { telemetry: this.#telemetry } : {}),
+				isBusy: (ctx) => this.isBusy(ctx),
+				readActiveContext: async (ctx) => {
+					const view = await this.#root.context(ctx);
+					return { entries: view.entries, messages: view.messages };
+				},
+				runPreHandoffConsolidation: async (ctx) => {
+					const report = await this.consolidateMemory(ctx);
+					return report.status === "ok";
+				},
+				resetWithBrief: (brief, ctx) => this.#root.reset(brief, ctx),
+				commit: (change, ctx) => this.#root.commit(change, ctx),
+			},
+			context,
+		);
+	}
+
+	/** Triggers a manual non-blocking `pi-durable` compaction pass on the root conversation. */
+	async compactWindow(context: Context, instructions?: string): Promise<TaskId<CompactionResult>> {
+		const taskId = await this.#root.compact(instructions, context);
+		this.#compactionTracker.lastTaskId = taskId;
+		return taskId;
+	}
+
+	/** Waits until foreground `afterRun` hooks and any triggered compaction task have completely settled. */
+	async waitForCompaction(context: Context): Promise<void> {
+		// Wait for any in-flight generation `afterRun` hook to finish admitting sweet-spot compaction first.
+		await this.#root.waitForIdle(context);
+		const live = await this.#harness.snapshot(LiveDoc, this.#root.id, context);
+		for (const status of live?.compactions ?? []) {
+			await this.#harness.waitForTask(status.taskId, context);
+		}
+		if (this.#compactionTracker.lastTaskId !== undefined) {
+			await this.#harness.waitForTask(this.#compactionTracker.lastTaskId, context);
+		}
+		await this.#root.waitForIdle(context);
+	}
+
+	/** Searches or looks up verbatim past turns across all immutable SQLite history past compaction/reset markers. */
+	async lookupHistory(query: HistoryLookupQuery, context: Context): Promise<HistoryLookupResult> {
+		const entries: EntryRecord[] = [];
+		let cursor: Cursor | undefined;
+		while (entries.length < 1_000) {
+			const page = await this.#root.entries({ order: "descending" }, 200, cursor, context);
+			for (const item of page.items) {
+				entries.push(item);
+				if (entries.length >= 1_000) break;
+			}
+			if (page.next === undefined) break;
+			cursor = page.next;
+		}
+		entries.reverse();
+		return lookupHistoryRecords(extractHistoryRecords(entries), query);
 	}
 
 	/** Searches active atomic memories deterministically without invoking an LLM. */

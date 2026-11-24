@@ -28,6 +28,10 @@ export type JeheeWorkerEnv = {
 	readonly JEHEE_MEMORY_CONSOLIDATION_IDLE_MS?: string;
 	readonly JEHEE_MEMORY_CONSOLIDATION_MIN_TURNS?: string;
 	readonly JEHEE_MEMORY_CONSOLIDATION_MODEL?: string;
+	readonly JEHEE_HANDOFF_SWEET_SPOT_TOKENS?: string;
+	readonly JEHEE_HANDOFF_KEEP_RECENT_TOKENS?: string;
+	readonly JEHEE_HANDOFF_CONSOLIDATE?: string;
+	readonly JEHEE_HANDOFF_MODEL?: string;
 	readonly JEHEE_STAGING_ROUTES?: string;
 	readonly JEHEE_DEBOUNCE_MS?: string;
 	readonly OPENCODE_API_KEY?: string;
@@ -143,6 +147,7 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 					defaultModel: config.defaultModel,
 					instructions: config.instructions,
 					memory,
+					handoff: config.handoff,
 					...(config.mcp !== undefined ? { mcp: config.mcp } : {}),
 					...(workshop !== undefined ? { workshop } : {}),
 					onWake: (wake) => {

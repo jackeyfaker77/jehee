@@ -190,6 +190,7 @@ export async function assembleNodeRuntime(
 			defaultModel: config.defaultModel,
 			instructions: config.instructions,
 			memory,
+			handoff: config.handoff,
 			...(mcp !== undefined ? { mcp } : {}),
 			...(workshop !== undefined ? { workshop } : {}),
 		},

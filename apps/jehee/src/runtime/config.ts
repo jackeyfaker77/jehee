@@ -1,6 +1,12 @@
 // Runtime environment parser shared between local Node CLI (`bin.ts`) and Cloudflare Workers (`worker.ts`).
 
 import type { ModelRef } from "@earendil-works/pi-durable";
+import {
+	DEFAULT_HANDOFF_KEEP_RECENT_TOKENS,
+	DEFAULT_HANDOFF_SWEET_SPOT_TOKENS,
+	type HandoffPolicy,
+	resolveHandoffPolicy,
+} from "../context/handoff.ts";
 import type { WriteApprovalPolicy } from "../governance/approvals.ts";
 import { type ProactiveQuietPolicy, parseQuietHoursWindow } from "../governance/quiet-gate.ts";
 import { type ParsedStdioServerInput, parseMcpConfigJson, parseMcpExposureEnv } from "../mcp/config.ts";
@@ -23,6 +29,7 @@ export type JeheeRuntimeConfig = {
 	readonly memoryProvider: "atomic" | "static";
 	readonly memoryCoreMaxChars: number;
 	readonly memoryConsolidation: MemoryConsolidationPolicy;
+	readonly handoff: HandoffPolicy;
 	readonly telegram?: {
 		readonly botToken: string;
 		readonly webhookSecret?: string;
@@ -242,6 +249,47 @@ export function parseJeheeEnvConfig(
 		...(consolidationModel !== undefined ? { model: consolidationModel } : {}),
 	};
 
+	const rawSweetSpot = env.JEHEE_HANDOFF_SWEET_SPOT_TOKENS?.trim();
+	const sweetSpotTokens =
+		rawSweetSpot !== undefined && rawSweetSpot.length > 0 ? Number(rawSweetSpot) : DEFAULT_HANDOFF_SWEET_SPOT_TOKENS;
+	if (!Number.isFinite(sweetSpotTokens) || sweetSpotTokens < 0) {
+		throw new Error(`Invalid JEHEE_HANDOFF_SWEET_SPOT_TOKENS "${rawSweetSpot}": must be a non-negative number`);
+	}
+
+	const rawKeepRecent = env.JEHEE_HANDOFF_KEEP_RECENT_TOKENS?.trim();
+	const keepRecentTokens =
+		rawKeepRecent !== undefined && rawKeepRecent.length > 0
+			? Number(rawKeepRecent)
+			: DEFAULT_HANDOFF_KEEP_RECENT_TOKENS;
+	if (!Number.isFinite(keepRecentTokens) || keepRecentTokens < 0) {
+		throw new Error(`Invalid JEHEE_HANDOFF_KEEP_RECENT_TOKENS "${rawKeepRecent}": must be a non-negative number`);
+	}
+
+	const rawHandoffConsol = env.JEHEE_HANDOFF_CONSOLIDATE?.trim().toLowerCase();
+	let consolidateBeforeHandoff = true;
+	if (rawHandoffConsol !== undefined && rawHandoffConsol.length > 0) {
+		if (rawHandoffConsol === "true" || rawHandoffConsol === "1") {
+			consolidateBeforeHandoff = true;
+		} else if (rawHandoffConsol === "false" || rawHandoffConsol === "0") {
+			consolidateBeforeHandoff = false;
+		} else {
+			throw new Error(`Invalid JEHEE_HANDOFF_CONSOLIDATE "${rawHandoffConsol}": expected "true" or "false"`);
+		}
+	}
+
+	const rawHandoffModel = env.JEHEE_HANDOFF_MODEL?.trim();
+	const handoffModel =
+		rawHandoffModel !== undefined && rawHandoffModel.length > 0
+			? resolveModelSpec(rawHandoffModel, models)
+			: undefined;
+
+	const handoff = resolveHandoffPolicy({
+		sweetSpotTokens,
+		keepRecentTokens,
+		consolidateBeforeHandoff,
+		...(handoffModel !== undefined ? { model: handoffModel } : {}),
+	});
+
 	return {
 		defaultModel,
 		instructions: env.JEHEE_INSTRUCTIONS?.trim() || DEFAULT_JEHEE_INSTRUCTIONS,
@@ -249,6 +297,7 @@ export function parseJeheeEnvConfig(
 		memoryProvider,
 		memoryCoreMaxChars: Math.floor(memoryCoreMaxChars),
 		memoryConsolidation,
+		handoff,
 		...(telegram !== undefined ? { telegram } : {}),
 		stagingAllowedRoutes: splitCsv(env.JEHEE_STAGING_ROUTES),
 		debounceMs,

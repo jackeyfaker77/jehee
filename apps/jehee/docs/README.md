@@ -55,6 +55,7 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [ADR-0010](./adr/0010-atomic-memory-and-eval.md) | 可插拔持久化原子记忆插件（L1 Core 一页纸 + 按需检索 + `/memory`）与 `Eval-0002`（Slice 5C-1） | Accepted | 2026-11-24 | 基于 `pi-durable` `MemoryDoc` 实现 100% 双栖可移植的原子记忆存储、低频 L1 Core 立即刷新、中英关键词/别名/时间检索与 `sourceEntryId` 溯源、软删除墓碑及 `/memory` 确定性指令，并规划 `Eval-0002` 对比评测。 |
 | [ADR-0011](./adr/0011-background-memory-consolidation.md) | 后台空闲/定时异步记忆整理（去重、冲突消解与隐性事实提炼）（Slice 5C-2） | Accepted | 2026-11-24 | 基于 `MemoryConsolidationDoc` 增量水位线、`pi-durable` 单活空闲休眠任务与严格 JSON Patch 校验器，实现零重复扫描的隐性事实提炼、重复合并、冲突消解（墓碑可逆恢复）及 `/memory consolidate` 确定性指令。 |
 | [ADR-0012](./adr/0012-portable-context-memory-snapshot.md) | 上下文与记忆的可移植快照（Portable Export / Import）（Slice 5C-3） | Accepted | 2026-11-24 | 定义 Harness/模型无关的 `jehee.portable.snapshot` v1 格式（无损 JSON + 人类/外部 Agent 可读 Markdown），实现 `JeheeHost` 事务级 `exportPortableSnapshot` / `importPortableSnapshot`（`merge`/`replace` 双模式）、CLI `export`/`import` 与 `/memory export` 白名单指令。 |
+| [ADR-0013](./adr/0013-seamless-window-handoff.md) | 单窗口无感换窗（Seamless Handoff）、换窗前记忆落盘与底层原话回查（Slice 5D） | Accepted | 2026-11-24 | 基于 `pi-durable` 原生 `CompactionTask` + `Conversation.reset(handoff)` 实现甜点水位自动压缩与 `/handoff` 整窗交接，通过 `beforeCompact` 先落盘 5C-2 原子记忆，并提供跨换窗 `history_search` 原话回查工具与 `Eval-0003` 双轨评测。 |
 
 ### 评测结论与失败复盘记录（Evals & Postmortems）
 
@@ -64,6 +65,7 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [Audit-0002](./evals/0002-adr-0006-to-0009-gate-audit-and-postmortem.md) | ADR-0006 至 ADR-0009 验收门禁补齐记录与根因复盘 | [ADR-0006](./adr/0006-nonblocking-telegram-polling-and-cli-boundary.md)–[0009](./adr/0009-external-coding-agent-workshop-gateway.md) | 2026-11-24 | 补齐 06–09 轮询守护、默认 `deferred` 资源发现、`approved` 重启消费、`/reject`/`/flush`/忙时与冷却治理、6 驱动首轮参数与 `followUp`/`steer` 全量验证（`33/33` 单测、`32/32` BDD），并修复 Worker 包 `node:child_process` 残留（`1861.6 KiB`）、Windows `stopJob` `EBUSY` 竞态及 `info/exclude` 隔离。 |
 | [Eval-0002](./evals/0003-memory-provider-eval-and-postmortem.md) | 热插拔持久化原子记忆插件（`StaticCore` vs `5C-1` vs `5C-2`）双轨三臂对比评测 | [ADR-0010](./adr/0010-atomic-memory-and-eval.md)–[0011](./adr/0011-background-memory-consolidation.md) | 2026-11-24 | `opencode-go/deepseek-v4.1-flash` 真机与离线双轨实测：`StaticCore` `14.3%` -> `AtomicMemory (5C-1)` `71.4%`（离线 `57.1%`）-> `5C-2 Consolidation` `100%`（单次全程账单 `\$0.00314`、`merged=1/superseded=1/skipped=0`），并借真机修复 `opencode-go` `MissingSessionID` 与替换旧值复述问题。 |
 | [Postmortem-0004](./evals/0004-cloudflare-workers-fetch-postmortem.md) | Cloudflare Workers 首次上线 `fetch` 非法调用故障复盘 | [ADR-0003](./adr/0003-cloud-topology-and-channel-gateway.md)–[0005](./adr/0005-runtime-entrypoints-and-opencode-go.md) | 2026-11-24 | 排查线上 Telegram Webhook `500`（`TypeError: Illegal invocation`），修复 `TelegramTransport` 与 `InstaBoxClient` 将 `globalThis.fetch` 作为实例字段直接调用的问题并补充严格 `this === undefined` 回归单测。 |
+| [Eval-0003](./evals/0005-handoff-eval-and-postmortem.md) | 单窗口无感换窗（`No-Handoff` vs `Seamless Handoff` 5D）双轨对比评测与复盘 | [ADR-0013](./adr/0013-seamless-window-handoff.md) | 2026-11-24 | `opencode-go/deepseek-v4.1-flash` 真机与离线双轨实测：`No-Handoff` `50%`（离线 `33.3%`，活跃窗口涨至 `3613` tok）-> `Seamless Handoff` `100%`（活跃窗口压降至 `778` tok，`-78.5%`，换窗重启后经 `history_search` 零失真逐字回查 `entryId=7` 原话），并归档 6 项问题留痕。 |
 
 ---
 
@@ -104,4 +106,4 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 
 ## 4. 后续计划立项队列
 
-- **ADR-0013（Slice 5D）**：L4 历史压缩抽屉与单窗口无感换窗（Seamless Handoff）。
+- 暂无待立项核心切片（Slice 1–5D 覆盖 PRD 全部四大功能板块，后续按真实 7×24 使用反馈迭代 Routines / 运行态 `/model` 热切 / 新渠道适配器）。

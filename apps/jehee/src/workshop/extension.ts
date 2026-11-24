@@ -20,6 +20,7 @@ import {
 	type TaskRuntime,
 } from "@earendil-works/pi-durable";
 import { bool, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
+import { JEHEE_CONTEXT_EXTENSION_HANDLE } from "../context/extension.ts";
 import { JEHEE_MEMORY_TOOLS_EXTENSION_HANDLE } from "../memory/bridge.ts";
 import { extractAssistantText } from "../memory/contract.ts";
 import { InstaBoxWorkshopBackend, type StartedWorkshopJob, type WorkshopExecutionBackend } from "./backend.ts";
@@ -558,7 +559,11 @@ export function createWorkshopBundle(options: WorkshopBundleOptions): WorkshopBu
 						const child = await tx.createConversation({ ownership: { kind: "task", taskId: anchor } });
 						await configure(tx, child.id, {
 							extensions: {
-								remove: [orchestratorExtension, JEHEE_MEMORY_TOOLS_EXTENSION_HANDLE],
+								remove: [
+									orchestratorExtension,
+									JEHEE_MEMORY_TOOLS_EXTENSION_HANDLE,
+									JEHEE_CONTEXT_EXTENSION_HANDLE,
+								],
 								add: [sandboxExtension!],
 							},
 							cwd: ws.cwd,
