@@ -1,0 +1,64 @@
+name: Jehee CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/jehee/**"
+      - ".github/workflows/jehee-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/jehee/**"
+      - ".github/workflows/jehee-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jehee-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  jehee:
+    name: Jehee Check, Tests & Offline Evals (Node 24)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build Jehee workspace dependencies
+        run: |
+          npm --prefix packages/telemetry run build
+          npm --prefix packages/schema run build
+          npm --prefix packages/chord run build
+          npm --prefix packages/mcp run build
+          npm --prefix packages/ai run hydrate-model-data
+          npm --prefix packages/ai run build:offline
+          npm --prefix packages/durable run build
+
+      - name: Check (Biome, tsc, Worker bundle)
+        run: npm --prefix apps/jehee run check
+
+      - name: Unit tests
+        run: npm --prefix apps/jehee run test:unit
+
+      - name: Cucumber BDD suite
+        run: npm --prefix apps/jehee run test:bdd
+
+      - name: Offline deterministic evals
+        run: |
+          npm --prefix apps/jehee run eval:mcp
+          npm --prefix apps/jehee run eval:memory
+          npm --prefix apps/jehee run eval:handoff
+          npm --prefix apps/jehee run eval:prod-memory
