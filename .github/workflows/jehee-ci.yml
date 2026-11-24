@@ -42,6 +42,7 @@ jobs:
           npm --prefix packages/telemetry run build
           npm --prefix packages/schema run build
           npm --prefix packages/chord run build
+          npm --prefix packages/codemode run build
           npm --prefix packages/mcp run build
           npm --prefix packages/ai run hydrate-model-data
           npm --prefix packages/ai run build:offline
