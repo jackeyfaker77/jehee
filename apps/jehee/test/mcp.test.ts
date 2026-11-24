@@ -490,4 +490,52 @@ describe("MCP blob vault, metric dictionary, and stdio connector", () => {
 			await rm(tmpDir, { recursive: true, force: true });
 		}
 	});
+
+	it("skips unreachable HTTP MCP servers cleanly when bestEffortConnect is enabled", async () => {
+		const faux = fauxProvider();
+		const models = createModels();
+		models.setProvider(faux.provider);
+		faux.setResponses([() => fauxAssistantMessage("手机离线不影响主对话。")]);
+
+		const failingFetch: typeof fetch = async () => {
+			throw new TypeError("fetch failed: phone offline");
+		};
+		const paleEnv = createMockPaleEnvironment({ pdfSizeBytes: 1_024, distractorServerCount: 0 });
+
+		const host = await JeheeHost.open(
+			{
+				storage: { kind: "memory" },
+				models,
+				defaultModel: { provider: "faux", modelId: faux.getModel().id },
+				mcp: {
+					bestEffortConnect: true,
+					servers: [
+						{
+							name: "phone",
+							requestTimeoutMs: 1_000,
+							transport: {
+								kind: "http",
+								url: "https://offline-phone.invalid/mcp",
+								openGetStream: false,
+								fetchImpl: failingFetch,
+							},
+						},
+						paleEnv.mailSpec,
+					],
+				},
+			},
+			BACKGROUND_CONTEXT,
+		);
+
+		try {
+			assert.deepEqual(host.mcpServerNames, ["mail"]);
+			const turn = await host.sendMessage({ text: "你好" }, BACKGROUND_CONTEXT);
+			assert.equal(turn.status, "done");
+			if (turn.status === "done") {
+				assert.equal(turn.replyText, "手机离线不影响主对话。");
+			}
+		} finally {
+			await host.close(BACKGROUND_CONTEXT);
+		}
+	});
 });

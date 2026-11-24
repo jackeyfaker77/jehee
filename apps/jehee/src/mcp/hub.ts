@@ -65,12 +65,13 @@ export class McpConnectorHub {
 		this.#clients = clients;
 	}
 
-	/** Connects and initializes all configured MCP servers, closing any partial connections if one fails. */
+	/** Connects and initializes configured MCP servers; when `bestEffort` is true, unreachable servers are skipped cleanly. */
 	static async connect(
 		specs: readonly JeheeMcpServerSpec[],
-		clientIdentity?: { readonly name?: string; readonly version?: string },
+		clientIdentity?: { readonly name?: string; readonly version?: string; readonly bestEffort?: boolean },
 	): Promise<McpConnectorHub> {
 		validateMcpServerSpecs(specs);
+		const bestEffort = clientIdentity?.bestEffort === true;
 		const connectedClients: McpClient[] = [];
 		const servers: ConnectedMcpServer[] = [];
 
@@ -84,6 +85,9 @@ export class McpConnectorHub {
 								url: spec.transport.url,
 								...(spec.transport.headers !== undefined ? { headers: { ...spec.transport.headers } } : {}),
 								...(spec.transport.fetchImpl !== undefined ? { fetch: spec.transport.fetchImpl } : {}),
+								...(spec.transport.openGetStream !== undefined
+									? { openGetStream: spec.transport.openGetStream }
+									: {}),
 							})
 						: spec.transport.create();
 				const client = new McpClient({
@@ -91,36 +95,47 @@ export class McpConnectorHub {
 					version: clientIdentity?.version ?? "0.1.0",
 					requestTimeoutMs: timeoutMs,
 				});
-				connectedClients.push(client);
-				await client.connect(transport);
+				try {
+					await client.connect(transport);
+					const capabilities = client.serverCapabilities;
+					const rawTools = capabilities?.tools !== undefined ? await client.listTools({ timeoutMs }) : [];
+					const tools = filterTools(rawTools, spec.includeTools, spec.excludeTools);
+					const hasResources = capabilities?.resources !== undefined;
+					const summary = truncateSummary(mcpServerSummary(spec.description, client.instructions));
 
-				const capabilities = client.serverCapabilities;
-				const rawTools = capabilities?.tools !== undefined ? await client.listTools({ timeoutMs }) : [];
-				const tools = filterTools(rawTools, spec.includeTools, spec.excludeTools);
-				const hasResources = capabilities?.resources !== undefined;
-				const summary = truncateSummary(mcpServerSummary(spec.description, client.instructions));
-
-				servers.push({
-					name,
-					summary,
-					...(client.instructions !== undefined ? { instructions: client.instructions } : {}),
-					tools,
-					hasResources,
-					hasResourceTemplates: hasResources,
-					requestTimeoutMs: timeoutMs,
-					listResourcesPage: (cursor, signal) =>
-						client.listResourcesPage(cursor, { timeoutMs, ...(signal !== undefined ? { signal } : {}) }),
-					listAllResources: (signal) =>
-						client.listResources({ timeoutMs, ...(signal !== undefined ? { signal } : {}) }),
-					listResourceTemplatesPage: (cursor, signal) =>
-						client.listResourceTemplatesPage(cursor, { timeoutMs, ...(signal !== undefined ? { signal } : {}) }),
-					listAllResourceTemplates: (signal) =>
-						client.listResourceTemplates({ timeoutMs, ...(signal !== undefined ? { signal } : {}) }),
-					readResource: (uri, signal) =>
-						client.readResource(uri, { timeoutMs, ...(signal !== undefined ? { signal } : {}) }),
-					callTool: (toolName, args, signal) =>
-						client.callTool(toolName, args, { timeoutMs, ...(signal !== undefined ? { signal } : {}) }),
-				});
+					connectedClients.push(client);
+					servers.push({
+						name,
+						summary,
+						...(client.instructions !== undefined ? { instructions: client.instructions } : {}),
+						tools,
+						hasResources,
+						hasResourceTemplates: hasResources,
+						requestTimeoutMs: timeoutMs,
+						listResourcesPage: (cursor, signal) =>
+							client.listResourcesPage(cursor, { timeoutMs, ...(signal !== undefined ? { signal } : {}) }),
+						listAllResources: (signal) =>
+							client.listResources({ timeoutMs, ...(signal !== undefined ? { signal } : {}) }),
+						listResourceTemplatesPage: (cursor, signal) =>
+							client.listResourceTemplatesPage(cursor, {
+								timeoutMs,
+								...(signal !== undefined ? { signal } : {}),
+							}),
+						listAllResourceTemplates: (signal) =>
+							client.listResourceTemplates({ timeoutMs, ...(signal !== undefined ? { signal } : {}) }),
+						readResource: (uri, signal) =>
+							client.readResource(uri, { timeoutMs, ...(signal !== undefined ? { signal } : {}) }),
+						callTool: (toolName, args, signal) =>
+							client.callTool(toolName, args, { timeoutMs, ...(signal !== undefined ? { signal } : {}) }),
+					});
+				} catch (error) {
+					await client.close().catch(() => undefined);
+					if (!bestEffort) {
+						throw error;
+					}
+					const detail = error instanceof Error ? error.message : String(error);
+					console.warn(`[jehee/mcp] skipped unreachable MCP server "${name}": ${detail}`);
+				}
 			}
 		} catch (error) {
 			await Promise.allSettled(connectedClients.map((client) => client.close()));

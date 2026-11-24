@@ -139,6 +139,25 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 						})()
 					: undefined;
 
+			const workerMcp =
+				config.mcp !== undefined
+					? {
+							...config.mcp,
+							bestEffortConnect: true,
+							servers: config.mcp.servers.map((server) =>
+								server.transport.kind === "http"
+									? {
+											...server,
+											transport: {
+												...server.transport,
+												openGetStream: false,
+											},
+										}
+									: server,
+							),
+						}
+					: undefined;
+
 			const storage = await openDurableObjectSqliteStorage(ctx.storage, { prefix: "jehee_" });
 			this.#host = await JeheeHost.open(
 				{
@@ -148,7 +167,7 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 					instructions: config.instructions,
 					memory,
 					handoff: config.handoff,
-					...(config.mcp !== undefined ? { mcp: config.mcp } : {}),
+					...(workerMcp !== undefined ? { mcp: workerMcp } : {}),
 					...(workshop !== undefined ? { workshop } : {}),
 					onWake: (wake) => {
 						void this.#armAlarm(wake).catch(() => ctx.abort("Failed to arm Durable Object alarm"));

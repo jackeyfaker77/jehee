@@ -13,6 +13,8 @@ export type JeheeMcpTransportConfig =
 			readonly url: string;
 			readonly headers?: Readonly<Record<string, string>>;
 			readonly fetchImpl?: McpFetch;
+			/** Whether to open the background server-to-client GET SSE stream after initialize (set `false` on serverless/DO). */
+			readonly openGetStream?: boolean;
 	  }
 	| {
 			readonly kind: "custom";
@@ -52,6 +54,8 @@ export type JeheeMcpOptions = {
 	readonly onApprovalRequested?: ApprovalRequestListener;
 	/** Optional deterministic gate invoked before non-readOnly MCP tools execute. */
 	readonly beforeWriteToolCall?: (call: McpWriteCallInfo) => McpWriteGateDecision | Promise<McpWriteGateDecision>;
+	/** When `true`, unreachable MCP servers are skipped at startup instead of failing `JeheeHost.open()` (recommended for edge/mobile relays). */
+	readonly bestEffortConnect?: boolean;
 };
 
 /** Snapshot of one connected MCP server instance held by `McpConnectorHub`. */

@@ -418,21 +418,25 @@ export class JeheeHost {
 		}
 		let mcpHub: McpConnectorHub | undefined;
 		if (options.mcp !== undefined) {
-			mcpHub = await McpConnectorHub.connect(options.mcp.servers);
-			const callerApprovalListener = options.mcp.onApprovalRequested;
-			const mcpBundle = createMcpBundle(mcpHub, {
-				...options.mcp,
-				onApprovalRequested: async (ticket) => {
-					if (callerApprovalListener !== undefined) {
-						await callerApprovalListener(ticket);
-					}
-					for (const listener of approvalListeners) {
-						await listener(ticket);
-					}
-				},
+			mcpHub = await McpConnectorHub.connect(options.mcp.servers, {
+				...(options.mcp.bestEffortConnect === true ? { bestEffort: true } : {}),
 			});
-			for (const ext of mcpBundle.extensions) {
-				registry.install(ext);
+			if (mcpHub.servers().length > 0) {
+				const callerApprovalListener = options.mcp.onApprovalRequested;
+				const mcpBundle = createMcpBundle(mcpHub, {
+					...options.mcp,
+					onApprovalRequested: async (ticket) => {
+						if (callerApprovalListener !== undefined) {
+							await callerApprovalListener(ticket);
+						}
+						for (const listener of approvalListeners) {
+							await listener(ticket);
+						}
+					},
+				});
+				for (const ext of mcpBundle.extensions) {
+					registry.install(ext);
+				}
 			}
 		}
 		let workshopBundle: WorkshopBundle | undefined;
