@@ -494,6 +494,20 @@ export class JeheeTraceRecorder {
 		return traces.at(-1);
 	}
 
+	/** Finds the settled trace whose `pi.durable.submit` span matches `submissionId`, falling back to latest trace. */
+	async findTraceBySubmissionId(submissionId: number | string): Promise<StoredTrace | undefined> {
+		const target = Number(submissionId);
+		const traces = await this.listTraces(100);
+		for (let i = traces.length - 1; i >= 0; i -= 1) {
+			const trace = traces[i]!;
+			const matched = trace.spans.some(
+				(span) => span.name === "pi.durable.submit" && Number(span.attributes["submission.id"]) === target,
+			);
+			if (matched) return trace;
+		}
+		return traces.at(-1);
+	}
+
 	/** Renders the latest trace's parent-child span forest as indented text. */
 	async renderLatestTrace(): Promise<string> {
 		const latest = await this.latestTrace();

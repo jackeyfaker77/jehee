@@ -89,7 +89,13 @@ import {
 	type PortableContextSnapshot,
 	type PortableDialogueTurn,
 } from "../memory/portable-snapshot.ts";
-import { startJeheeMemorySpan } from "../telemetry/recorder.ts";
+import {
+	appendPersistedTrace,
+	buildPersistedTraceInput,
+	type PersistedTraceEntry,
+	TraceDoc,
+} from "../telemetry/durable-store.ts";
+import { JeheeTraceRecorder, startJeheeMemorySpan } from "../telemetry/recorder.ts";
 import type { WorkshopExecutionBackend } from "../workshop/backend.ts";
 import type { CustomCodingAgentTemplate, WorkshopDriverName } from "../workshop/coding-agent-driver.ts";
 import { createWorkshopBundle, type WorkshopBundle, WorkshopRegistryDoc } from "../workshop/extension.ts";
@@ -122,6 +128,8 @@ export type JeheeHostOptions = {
 	readonly workshop?: JeheeWorkshopOptions;
 	readonly extensions?: readonly Extension[];
 	readonly telemetry?: TelemetryContext;
+	/** Optional trace recorder whose settled turns are persisted into SQLite `TraceDoc` (created automatically when `telemetry` is omitted). */
+	readonly traceRecorder?: JeheeTraceRecorder;
 	readonly cwd?: string;
 	readonly env?: HarnessOptions["env"];
 	readonly now?: () => number;
@@ -269,6 +277,7 @@ export class JeheeHost {
 	readonly #models: Models;
 	readonly #defaultModel: ModelRef;
 	readonly #telemetry: TelemetryContext | undefined;
+	readonly #traceRecorder: JeheeTraceRecorder | undefined;
 	readonly #proactiveListeners: Set<ProactiveReplyListener>;
 	readonly #approvalListeners: Set<ApprovalRequestListener>;
 	readonly #mcpHub: McpConnectorHub | undefined;
@@ -286,6 +295,7 @@ export class JeheeHost {
 		models: Models,
 		defaultModel: ModelRef,
 		telemetry: TelemetryContext | undefined,
+		traceRecorder: JeheeTraceRecorder | undefined,
 		memoryHolder: { current: MemoryProvider | undefined },
 		handoffPolicy: HandoffPolicy,
 		compactionTracker: { lastTaskId: TaskId<CompactionResult> | undefined },
@@ -302,6 +312,7 @@ export class JeheeHost {
 		this.#models = models;
 		this.#defaultModel = defaultModel;
 		this.#telemetry = telemetry;
+		this.#traceRecorder = traceRecorder;
 		this.#memoryHolder = memoryHolder;
 		this.#handoffPolicy = handoffPolicy;
 		this.#compactionTracker = compactionTracker;
@@ -320,13 +331,16 @@ export class JeheeHost {
 		const proactiveListeners = new Set<ProactiveReplyListener>();
 		const approvalListeners = new Set<ApprovalRequestListener>();
 		const nowFn = options.now ?? Date.now;
+		const traceRecorder =
+			options.traceRecorder ?? (options.telemetry === undefined ? new JeheeTraceRecorder() : undefined);
+		const effectiveTelemetry = options.telemetry ?? traceRecorder?.telemetry;
 		const memoryHolder: { current: MemoryProvider | undefined } = { current: options.memory };
 		const handoffPolicy = resolveHandoffPolicy(options.handoff);
 		const compactionTracker: { lastTaskId: TaskId<CompactionResult> | undefined } = { lastTaskId: undefined };
 		const consolidatorTask = createMemoryConsolidatorTask({
 			getAtomic: () => memoryHolder.current?.atomic,
 			defaultModel: options.defaultModel,
-			...(options.telemetry !== undefined ? { telemetry: options.telemetry } : {}),
+			...(effectiveTelemetry !== undefined ? { telemetry: effectiveTelemetry } : {}),
 		});
 		let harnessRef: Harness | undefined;
 		let rootRef: Conversation | undefined;
@@ -342,7 +356,7 @@ export class JeheeHost {
 					models: options.models,
 					defaultModel: options.defaultModel,
 					now: nowFn,
-					...(options.telemetry !== undefined ? { telemetry: options.telemetry } : {}),
+					...(effectiveTelemetry !== undefined ? { telemetry: effectiveTelemetry } : {}),
 					commit: (change, ctx) => rootRef!.commit(change, ctx),
 				},
 				hookCtx,
@@ -391,7 +405,7 @@ export class JeheeHost {
 				getDefaultModel: () => options.defaultModel,
 				getModels: () => options.models,
 				getNow: nowFn,
-				getTelemetry: () => options.telemetry,
+				getTelemetry: () => effectiveTelemetry,
 				isRootConversation: (convId) => rootRef !== undefined && convId === rootRef.id,
 				runPreHandoffConsolidation,
 				recordAutoCompaction: async (metrics, hookCtx) => {
@@ -479,7 +493,7 @@ export class JeheeHost {
 				{
 					models: options.models,
 					registry,
-					...(options.telemetry !== undefined ? { telemetry: options.telemetry } : {}),
+					...(effectiveTelemetry !== undefined ? { telemetry: effectiveTelemetry } : {}),
 					...(options.env !== undefined ? { env: options.env } : {}),
 					...(options.now !== undefined ? { now: options.now } : {}),
 					...(options.onWake !== undefined ? { onWake: options.onWake } : {}),
@@ -522,7 +536,8 @@ export class JeheeHost {
 				root,
 				options.models,
 				options.defaultModel,
-				options.telemetry,
+				effectiveTelemetry,
+				traceRecorder,
 				memoryHolder,
 				handoffPolicy,
 				compactionTracker,
@@ -1021,6 +1036,7 @@ export class JeheeHost {
 					const answerEntry = await this.#root.commit((tx) => tx.entry(AssistantEntry, settled.answer), waitCtx);
 					const modelMsg = answerEntry?.model?.[0];
 					const replyText = modelMsg?.role === "assistant" ? extractAssistantText(modelMsg) : "";
+					await this.#persistSubmissionTrace(submission.id, input.text, false, waitCtx);
 					return {
 						submissionId: submission.id,
 						status: "done",
@@ -1028,6 +1044,7 @@ export class JeheeHost {
 						replyText,
 					};
 				}
+				await this.#persistSubmissionTrace(submission.id, input.text, true, waitCtx);
 				return {
 					submissionId: submission.id,
 					status: "unanswered",
@@ -1036,6 +1053,47 @@ export class JeheeHost {
 			},
 			abort: (abortCtx: Context) => submission.abort(abortCtx),
 		};
+	}
+
+	async #persistSubmissionTrace(
+		submissionId: SubmissionId,
+		label: string,
+		turnError: boolean,
+		context: Context,
+	): Promise<void> {
+		if (this.#traceRecorder === undefined) return;
+		try {
+			const trace = await this.#traceRecorder.findTraceBySubmissionId(submissionId);
+			if (trace === undefined) return;
+			const payload = buildPersistedTraceInput(trace, {
+				label,
+				recordedAtMs: this.#now(),
+				submissionId: Number(submissionId),
+				turnError,
+			});
+			await this.#root.commit(async (tx) => {
+				const doc = await tx.doc(TraceDoc);
+				appendPersistedTrace(doc, payload);
+			}, context);
+		} catch {
+			// Best-effort observability: never block or fail a user turn due to trace persistence.
+		}
+	}
+
+	/** Lists recently persisted turn traces from SQLite `TraceDoc`, newest first. */
+	async listTraces(context: Context, limit: number = 10): Promise<readonly PersistedTraceEntry[]> {
+		const doc = await this.#harness.snapshot(TraceDoc, context);
+		if (doc === undefined || doc.entries.length === 0) return [];
+		const clamped = Math.max(1, Math.min(50, Math.floor(limit)));
+		return [...doc.entries].reverse().slice(0, clamped);
+	}
+
+	/** Reads one persisted trace entry by numeric `id`, or the newest trace when `id` is omitted. */
+	async getTrace(context: Context, id?: number): Promise<PersistedTraceEntry | undefined> {
+		const doc = await this.#harness.snapshot(TraceDoc, context);
+		if (doc === undefined || doc.entries.length === 0) return undefined;
+		if (id === undefined) return doc.entries.at(-1);
+		return doc.entries.find((entry) => entry.id === id);
 	}
 
 	/** Admits a user message and waits for the turn's final answer. */

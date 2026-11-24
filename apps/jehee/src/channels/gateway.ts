@@ -10,6 +10,7 @@ import { ProactiveNotificationGovernor, type ProactiveQuietPolicy } from "../gov
 import { formatMemoryInspectReply, formatMemorySearchReply } from "../memory/atomic-memory.ts";
 import { formatConsolidationReportReply } from "../memory/consolidator.ts";
 import { renderPortableSnapshotMarkdown, serializePortableSnapshotJson } from "../memory/portable-snapshot.ts";
+import { formatTraceDetailReply, formatTraceListReply } from "../telemetry/durable-store.ts";
 import {
 	type ChannelRoute,
 	type ChannelSendOptions,
@@ -37,7 +38,7 @@ export type ChannelGatewayOptions = {
 };
 
 /** Deterministic slash commands handled directly by `ChannelGateway`. */
-export type GatewaySlashCommand = "status" | "stop" | "approve" | "reject" | "flush" | "memory" | "handoff";
+export type GatewaySlashCommand = "status" | "stop" | "approve" | "reject" | "flush" | "memory" | "handoff" | "trace";
 
 /** Outcome reported after ingesting or flushing an inbound message or button callback. */
 export type IngestResult =
@@ -81,6 +82,10 @@ function parseSlashCommand(trimmed: string): { readonly cmd: GatewaySlashCommand
 	if (trimmed === "/handoff" || trimmed.startsWith("/handoff ")) {
 		const arg = trimmed.slice("/handoff".length).trim();
 		return arg.length > 0 ? { cmd: "handoff", arg } : { cmd: "handoff" };
+	}
+	if (trimmed === "/trace" || trimmed.startsWith("/trace ")) {
+		const arg = trimmed.slice("/trace".length).trim();
+		return arg.length > 0 ? { cmd: "trace", arg } : { cmd: "trace" };
 	}
 	return undefined;
 }
@@ -390,6 +395,28 @@ export class ChannelGateway {
 				replyToMessageId: message.messageId,
 			});
 			return { settled: Promise.resolve({ kind: "command_handled", command: "handoff" }) };
+		}
+
+		if (cmd === "trace") {
+			const trimmedArg = arg?.trim() ?? "";
+			let reply: string;
+			if (trimmedArg.toLowerCase() === "list") {
+				const entries = await this.#host.listTraces(context, 10);
+				reply = formatTraceListReply(entries);
+			} else if (trimmedArg.length === 0) {
+				const latest = await this.#host.getTrace(context);
+				reply = formatTraceDetailReply(latest);
+			} else if (/^#?\d+$/.test(trimmedArg)) {
+				const requestedId = Number.parseInt(trimmedArg.replace(/^#/, ""), 10);
+				const entry = await this.#host.getTrace(context, requestedId);
+				reply = formatTraceDetailReply(entry, requestedId);
+			} else {
+				reply = "用法：/trace（最新一轮决策树）| /trace list（最近 10 轮摘要）| /trace <编号>";
+			}
+			await this.#deliverOutbound(message.channel, message.chatId, reply, {
+				replyToMessageId: message.messageId,
+			});
+			return { settled: Promise.resolve({ kind: "command_handled", command: "trace" }) };
 		}
 
 		const busy = await this.#host.isBusy(context);

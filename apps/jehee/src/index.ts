@@ -249,6 +249,17 @@ export {
 	resolveModelSpec,
 } from "./runtime/models.ts";
 export {
+	appendPersistedTrace,
+	buildPersistedTraceInput,
+	createEmptyTraceStoreState,
+	formatTraceDetailReply,
+	formatTraceListReply,
+	MAX_PERSISTED_TRACES,
+	type PersistedTraceEntry,
+	TraceDoc,
+	type TraceStoreState,
+} from "./telemetry/durable-store.ts";
+export {
 	buildPostmortemReport,
 	classifyFailureRootCause,
 	computeTraceMetrics,
