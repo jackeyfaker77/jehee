@@ -8,7 +8,7 @@ import {
 	resolveHandoffPolicy,
 } from "../context/handoff.ts";
 import type { WriteApprovalPolicy } from "../governance/approvals.ts";
-import { type ProactiveQuietPolicy, parseQuietHoursWindow } from "../governance/quiet-gate.ts";
+import { type ProactiveQuietPolicy, parseQuietHoursWindow, parseUtcOffsetMinutes } from "../governance/quiet-gate.ts";
 import { type ParsedStdioServerInput, parseMcpConfigJson, parseMcpExposureEnv } from "../mcp/config.ts";
 import type { JeheeMcpExposure, JeheeMcpOptions, JeheeMcpServerSpec } from "../mcp/contract.ts";
 import { DEFAULT_MAX_CORE_CHARS, parseMemoryProviderEnv } from "../memory/atomic-memory.ts";
@@ -55,6 +55,8 @@ export type JeheeRuntimeConfig = {
 	readonly mcpExposure?: JeheeMcpExposure;
 	readonly writeGate?: WriteApprovalPolicy;
 	readonly quietPolicy?: ProactiveQuietPolicy;
+	/** Parsed fixed UTC offset in minutes from `JEHEE_TZ_OFFSET` (defaults to `+08:00` = `480`). */
+	readonly utcOffsetMinutes: number;
 };
 
 const DEFAULT_JEHEE_INSTRUCTIONS =
@@ -197,6 +199,7 @@ export function parseJeheeEnvConfig(
 
 	const rawQuietHours = env.JEHEE_QUIET_HOURS?.trim();
 	const tzOffset = env.JEHEE_TZ_OFFSET?.trim() || "+08:00";
+	const utcOffsetMinutes = parseUtcOffsetMinutes(tzOffset);
 	const quietHours =
 		rawQuietHours !== undefined && rawQuietHours.length > 0
 			? parseQuietHoursWindow(rawQuietHours, tzOffset)
@@ -311,5 +314,6 @@ export function parseJeheeEnvConfig(
 		...(mcpExposure !== undefined ? { mcpExposure } : {}),
 		...(writeGate !== undefined ? { writeGate } : {}),
 		...(quietPolicy !== undefined ? { quietPolicy } : {}),
+		utcOffsetMinutes,
 	};
 }

@@ -23,6 +23,8 @@ import { bool, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
 import { JEHEE_CONTEXT_EXTENSION_HANDLE } from "../context/extension.ts";
 import { JEHEE_MEMORY_TOOLS_EXTENSION_HANDLE } from "../memory/bridge.ts";
 import { extractAssistantText } from "../memory/contract.ts";
+import { JEHEE_ROUTINES_EXTENSION_HANDLE } from "../routines/extension.ts";
+import { JEHEE_WEB_EXTENSION_HANDLE } from "../web/extension.ts";
 import { InstaBoxWorkshopBackend, type StartedWorkshopJob, type WorkshopExecutionBackend } from "./backend.ts";
 import {
 	ALL_WORKSHOP_DRIVER_NAMES,
@@ -563,6 +565,8 @@ export function createWorkshopBundle(options: WorkshopBundleOptions): WorkshopBu
 									orchestratorExtension,
 									JEHEE_MEMORY_TOOLS_EXTENSION_HANDLE,
 									JEHEE_CONTEXT_EXTENSION_HANDLE,
+									JEHEE_ROUTINES_EXTENSION_HANDLE,
+									JEHEE_WEB_EXTENSION_HANDLE,
 								],
 								add: [sandboxExtension!],
 							},

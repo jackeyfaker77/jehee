@@ -6,7 +6,9 @@
 	"vars": {
 		"JEHEE_MODEL": "opencode-go/deepseek-v4.1-flash",
 		"JEHEE_MEMORY_PROVIDER": "atomic",
-		"JEHEE_MEMORY_CONSOLIDATION_IDLE_MS": "600000"
+		"JEHEE_MEMORY_CONSOLIDATION_IDLE_MS": "600000",
+		"JEHEE_TZ_OFFSET": "+08:00",
+		"JEHEE_QUIET_HOURS": "23:00-08:00"
 	},
 	"durable_objects": {
 		"bindings": [

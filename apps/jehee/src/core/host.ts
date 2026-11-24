@@ -3,7 +3,7 @@
 // or child_process imports) so the exact same class powers both Node 24 and Cloudflare Workers Durable Objects.
 
 import type { Context } from "@earendil-works/chord/context";
-import type { AssistantMessage, Models } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, Models } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
 	CompactionEntry,
@@ -31,6 +31,7 @@ import {
 	type Wake,
 } from "@earendil-works/pi-durable";
 import type { TelemetryContext } from "@earendil-works/pi-telemetry";
+import type { ChannelRoute } from "../channels/contract.ts";
 import { HandoffDoc } from "../context/durable-store.ts";
 import { createContextExtension, executeManualWindowHandoff, extractHistoryRecords } from "../context/extension.ts";
 import {
@@ -89,6 +90,32 @@ import {
 	type PortableContextSnapshot,
 	type PortableDialogueTurn,
 } from "../memory/portable-snapshot.ts";
+import type {
+	DirectNotifyListener,
+	RoutineCreateInput,
+	RoutineCreateResult,
+	RoutineDeleteResult,
+	RoutineItem,
+	RoutineRunOutcome,
+} from "../routines/contract.ts";
+import { LastRouteDoc, RoutineDoc } from "../routines/durable-store.ts";
+import {
+	createRoutineSchedulerTask,
+	createRoutineSchedulerTracker,
+	createRoutinesExtension,
+	dispatchRoutineExecution,
+	type RoutineSchedulerTaskToken,
+	type RoutineSchedulerTracker,
+	syncRoutineSchedulerInTx,
+} from "../routines/extension.ts";
+import {
+	cloneRoutineItem,
+	createEmptyRoutineStoreState,
+	createRoutineInState,
+	DEFAULT_UTC_OFFSET_MINUTES,
+	deleteRoutineInState,
+	listRoutinesFromState,
+} from "../routines/scheduler.ts";
 import {
 	appendPersistedTrace,
 	buildPersistedTraceInput,
@@ -96,6 +123,7 @@ import {
 	TraceDoc,
 } from "../telemetry/durable-store.ts";
 import { JeheeTraceRecorder, startJeheeMemorySpan } from "../telemetry/recorder.ts";
+import { type CreateWebExtensionOptions, createWebExtension, JEHEE_WEB_EXTENSION_NAME } from "../web/extension.ts";
 import type { WorkshopExecutionBackend } from "../workshop/backend.ts";
 import type { CustomCodingAgentTemplate, WorkshopDriverName } from "../workshop/coding-agent-driver.ts";
 import { createWorkshopBundle, type WorkshopBundle, WorkshopRegistryDoc } from "../workshop/extension.ts";
@@ -124,6 +152,14 @@ export type JeheeHostOptions = {
 	readonly instructions?: string;
 	readonly memory?: MemoryProvider;
 	readonly handoff?: Partial<HandoffPolicy>;
+	/** Fixed local UTC offset in minutes (default `480` = `+08:00`) for clock anchor and daily/weekly routines. */
+	readonly utcOffsetMinutes?: number;
+	/** Explicit toggle for eager routine tools (`routine_create`/`routine_list`/`routine_delete`). Defaults to enabled when atomic memory or handoff is mounted. */
+	readonly enableRoutines?: boolean;
+	/** Explicit toggle for eager `web_fetch` tool. Defaults to enabled when routines, atomic memory, or handoff is mounted. */
+	readonly enableWebFetch?: boolean;
+	/** Optional configuration overrides for the built-in `"jehee.web"` (`web_fetch`) extension. */
+	readonly webFetch?: CreateWebExtensionOptions;
 	readonly mcp?: JeheeMcpOptions;
 	readonly workshop?: JeheeWorkshopOptions;
 	readonly extensions?: readonly Extension[];
@@ -134,6 +170,8 @@ export type JeheeHostOptions = {
 	readonly env?: HarnessOptions["env"];
 	readonly now?: () => number;
 	readonly onWake?: (wake: Wake) => void;
+	/** Whether `JeheeHost.open` immediately resumes durable background tasks (default `true`). Pass `false` when wiring `ChannelGateway` listeners before calling `host.resume()`. */
+	readonly autoResume?: boolean;
 };
 
 /** Cumulative token, KV-cache hit rate, and spend summary for the root conversation. */
@@ -150,6 +188,7 @@ export type JeheeUsageSummary = {
 /** Inbound user message delivered to the single-entry root conversation. */
 export type JeheeSendInput = {
 	readonly text: string;
+	readonly images?: readonly ImageContent[];
 	readonly requestId?: string;
 	readonly whenBusy?: "steer" | "followUp" | "reject";
 };
@@ -181,8 +220,12 @@ export type JeheeHistoryItem = {
 	readonly text: string;
 };
 
-/** Listener notified when a background workshop report triggers a main-conversation reply. */
-export type ProactiveReplyListener = (replyText: string, answerEntryId: EntryId) => void | Promise<void>;
+/** Listener notified when a background workshop report or agent routine triggers a main-conversation reply. */
+export type ProactiveReplyListener = (
+	replyText: string,
+	answerEntryId: EntryId,
+	options?: { readonly urgency?: "normal" | "urgent" },
+) => void | Promise<void>;
 
 /** Outcome of resolving (`approve` or `reject`) a durable write-approval ticket on `JeheeHost`. */
 export type ResolveApprovalResult =
@@ -279,13 +322,17 @@ export class JeheeHost {
 	readonly #telemetry: TelemetryContext | undefined;
 	readonly #traceRecorder: JeheeTraceRecorder | undefined;
 	readonly #proactiveListeners: Set<ProactiveReplyListener>;
+	readonly #directNotifyListeners: Set<DirectNotifyListener>;
 	readonly #approvalListeners: Set<ApprovalRequestListener>;
 	readonly #mcpHub: McpConnectorHub | undefined;
 	readonly #now: () => number;
+	readonly #utcOffsetMinutes: number;
 	readonly #memoryHolder: { current: MemoryProvider | undefined };
 	readonly #handoffPolicy: HandoffPolicy;
 	readonly #compactionTracker: { lastTaskId: TaskId<CompactionResult> | undefined };
 	readonly #consolidatorTask: MemoryConsolidatorTaskToken;
+	readonly #routineSchedulerTask: RoutineSchedulerTaskToken;
+	readonly #routineTracker: RoutineSchedulerTracker;
 	readonly #onRootTurnCompleted: (conversationId: ConversationId, context: Context) => Promise<void>;
 
 	private constructor(
@@ -300,11 +347,15 @@ export class JeheeHost {
 		handoffPolicy: HandoffPolicy,
 		compactionTracker: { lastTaskId: TaskId<CompactionResult> | undefined },
 		consolidatorTask: MemoryConsolidatorTaskToken,
+		routineSchedulerTask: RoutineSchedulerTaskToken,
+		routineTracker: RoutineSchedulerTracker,
 		onRootTurnCompleted: (conversationId: ConversationId, context: Context) => Promise<void>,
 		proactiveListeners: Set<ProactiveReplyListener>,
+		directNotifyListeners: Set<DirectNotifyListener>,
 		approvalListeners: Set<ApprovalRequestListener>,
 		mcpHub: McpConnectorHub | undefined,
 		now: () => number,
+		utcOffsetMinutes: number,
 	) {
 		this.#harness = harness;
 		this.#registry = registry;
@@ -317,11 +368,15 @@ export class JeheeHost {
 		this.#handoffPolicy = handoffPolicy;
 		this.#compactionTracker = compactionTracker;
 		this.#consolidatorTask = consolidatorTask;
+		this.#routineSchedulerTask = routineSchedulerTask;
+		this.#routineTracker = routineTracker;
 		this.#onRootTurnCompleted = onRootTurnCompleted;
 		this.#proactiveListeners = proactiveListeners;
+		this.#directNotifyListeners = directNotifyListeners;
 		this.#approvalListeners = approvalListeners;
 		this.#mcpHub = mcpHub;
 		this.#now = now;
+		this.#utcOffsetMinutes = utcOffsetMinutes;
 	}
 
 	/** Opens storage, connects MCP servers, installs extensions and memory, initializes the root conversation, and resumes tasks. */
@@ -329,8 +384,10 @@ export class JeheeHost {
 		const storage: Storage = options.storage.kind === "memory" ? new MemoryStorage() : options.storage.storage;
 		const registry = createRegistry();
 		const proactiveListeners = new Set<ProactiveReplyListener>();
+		const directNotifyListeners = new Set<DirectNotifyListener>();
 		const approvalListeners = new Set<ApprovalRequestListener>();
 		const nowFn = options.now ?? Date.now;
+		const utcOffsetMinutes = options.utcOffsetMinutes ?? DEFAULT_UTC_OFFSET_MINUTES;
 		const traceRecorder =
 			options.traceRecorder ?? (options.telemetry === undefined ? new JeheeTraceRecorder() : undefined);
 		const effectiveTelemetry = options.telemetry ?? traceRecorder?.telemetry;
@@ -341,6 +398,22 @@ export class JeheeHost {
 			getAtomic: () => memoryHolder.current?.atomic,
 			defaultModel: options.defaultModel,
 			...(effectiveTelemetry !== undefined ? { telemetry: effectiveTelemetry } : {}),
+		});
+		const routineTracker = createRoutineSchedulerTracker();
+		const routineSchedulerTask = createRoutineSchedulerTask({
+			getUtcOffsetMinutes: () => utcOffsetMinutes,
+			getTelemetry: () => effectiveTelemetry,
+			tracker: routineTracker,
+			onDirectNotify: async (event) => {
+				for (const listener of directNotifyListeners) {
+					await listener(event);
+				}
+			},
+			onAgentProactiveReply: async (replyText, answerEntryId, urgency) => {
+				for (const listener of proactiveListeners) {
+					await listener(replyText, answerEntryId, { urgency });
+				}
+			},
 		});
 		let harnessRef: Harness | undefined;
 		let rootRef: Conversation | undefined;
@@ -424,6 +497,36 @@ export class JeheeHost {
 				onRootAfterRun: onRootContextAfterRun,
 			}),
 		);
+		const enableRoutineTools =
+			options.enableRoutines ?? (options.memory?.atomic !== undefined || options.handoff !== undefined);
+		const enableClockAnchor =
+			options.enableRoutines ??
+			(options.utcOffsetMinutes !== undefined ||
+				options.memory?.atomic !== undefined ||
+				options.handoff !== undefined);
+		registry.install(
+			createRoutinesExtension({
+				enableRoutineTools,
+				enableClockAnchor,
+				schedulerTask: routineSchedulerTask,
+				getUtcOffsetMinutes: () => utcOffsetMinutes,
+				getNow: nowFn,
+				isRootConversation: (convId) => rootRef !== undefined && convId === rootRef.id,
+			}),
+		);
+		const hasCustomWebExtension = (options.extensions ?? []).some((ext) => ext.name === JEHEE_WEB_EXTENSION_NAME);
+		if (!hasCustomWebExtension) {
+			const enableWebFetch =
+				options.enableWebFetch ??
+				options.webFetch?.enabled ??
+				(options.enableRoutines === true || options.memory?.atomic !== undefined || options.handoff !== undefined);
+			registry.install(
+				createWebExtension({
+					...options.webFetch,
+					enabled: enableWebFetch,
+				}),
+			);
+		}
 		if (options.memory !== undefined) {
 			registry.install(createMemoryExtension(options.memory, { onRootTurnCompleted }));
 			registry.install(createMemoryToolsExtension(options.memory, consolidatorTask));
@@ -529,7 +632,9 @@ export class JeheeHost {
 				},
 				context,
 			);
-			harness.resume();
+			if (options.autoResume !== false) {
+				harness.resume();
+			}
 			return new JeheeHost(
 				harness,
 				registry,
@@ -542,11 +647,15 @@ export class JeheeHost {
 				handoffPolicy,
 				compactionTracker,
 				consolidatorTask,
+				routineSchedulerTask,
+				routineTracker,
 				onRootTurnCompleted,
 				proactiveListeners,
+				directNotifyListeners,
 				approvalListeners,
 				mcpHub,
 				nowFn,
+				utcOffsetMinutes,
 			);
 		} catch (error) {
 			await mcpHub?.close();
@@ -567,6 +676,11 @@ export class JeheeHost {
 	/** Configured names of currently connected MCP servers (empty when no MCP servers are mounted). */
 	get mcpServerNames(): readonly string[] {
 		return this.#mcpHub?.servers().map((server) => server.name) ?? [];
+	}
+
+	/** Configured fixed local UTC offset in minutes used for clock anchor and routines. */
+	get utcOffsetMinutes(): number {
+		return this.#utcOffsetMinutes;
 	}
 
 	/** Current wake status of the underlying durable scheduler (for Cloudflare Durable Object alarms). */
@@ -1019,10 +1133,14 @@ export class JeheeHost {
 
 	/** Durably admits a user message (or returns the existing submission on matching `requestId`) without blocking on completion. */
 	async submitMessage(input: JeheeSendInput, context: Context): Promise<JeheePendingTurn> {
+		const content =
+			input.images !== undefined && input.images.length > 0
+				? [{ type: "text" as const, text: input.text }, ...input.images]
+				: input.text;
 		const submission: Submission = await this.#root.submit(
 			{
 				type: "input",
-				content: input.text,
+				content,
 				...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
 				...(input.whenBusy !== undefined ? { whenBusy: input.whenBusy } : {}),
 			},
@@ -1128,12 +1246,188 @@ export class JeheeHost {
 		await this.#root.abort(context);
 	}
 
-	/** Subscribes to unsolicited main-agent replies produced after background workshop reports arrive. */
+	/** Subscribes to unsolicited main-agent replies produced after background workshop reports or agent routines arrive. */
 	onProactiveReply(listener: ProactiveReplyListener): () => void {
 		this.#proactiveListeners.add(listener);
 		return () => {
 			this.#proactiveListeners.delete(listener);
 		};
+	}
+
+	/** Subscribes to zero-token direct proactive notifications emitted by `direct_notify` routines. */
+	onDirectNotify(listener: DirectNotifyListener): () => void {
+		this.#directNotifyListeners.add(listener);
+		return () => {
+			this.#directNotifyListeners.delete(listener);
+		};
+	}
+
+	/** Creates a durable reminder or recurring routine in `RoutineDoc` and syncs the single-flight scheduler task. */
+	async createRoutine(input: RoutineCreateInput, context: Context): Promise<RoutineCreateResult> {
+		const nowMs = this.#now();
+		return this.#root.commit(async (tx) => {
+			const doc = await tx.doc(RoutineDoc);
+			const result = createRoutineInState(doc, input, nowMs);
+			if (result.ok) {
+				await syncRoutineSchedulerInTx(tx, this.#routineSchedulerTask, nowMs);
+			}
+			return result;
+		}, context);
+	}
+
+	/** Lists scheduled reminders and recurring routines persisted in `RoutineDoc`. */
+	async listRoutines(
+		context: Context,
+		options?: { readonly includeDisabled?: boolean },
+	): Promise<readonly RoutineItem[]> {
+		const doc = (await this.#harness.snapshot(RoutineDoc, context)) ?? createEmptyRoutineStoreState();
+		return listRoutinesFromState(doc, options?.includeDisabled === true);
+	}
+
+	/** Deletes (cancels) a scheduled routine by ID in `RoutineDoc` and syncs the single-flight scheduler task. */
+	async deleteRoutine(id: string, context: Context): Promise<RoutineDeleteResult> {
+		const nowMs = this.#now();
+		return this.#root.commit(async (tx) => {
+			const doc = await tx.doc(RoutineDoc);
+			const result = deleteRoutineInState(doc, id);
+			if (result.ok) {
+				await syncRoutineSchedulerInTx(tx, this.#routineSchedulerTask, nowMs);
+			}
+			return result;
+		}, context);
+	}
+
+	/** Triggers an existing routine immediately (manual run) without altering its recurring schedule. */
+	async runRoutineNow(id: string, context: Context): Promise<RoutineRunOutcome> {
+		const trimmed = id.trim();
+		const fireAtMs = this.#now();
+		const target = await this.#root.commit(async (tx) => {
+			const doc = await tx.doc(RoutineDoc);
+			const found = Object.hasOwn(doc.items, trimmed) ? doc.items[trimmed] : undefined;
+			if (found === undefined) return undefined;
+			found.runCount += 1;
+			found.lastRunAtMs = fireAtMs;
+			found.updatedAtMs = fireAtMs;
+			return cloneRoutineItem(found);
+		}, context);
+
+		if (target === undefined) {
+			return { ok: false, reason: "not_found", id: trimmed };
+		}
+
+		const endDispatch = this.#routineTracker.beginDispatch();
+		try {
+			return await dispatchRoutineExecution(
+				{
+					item: {
+						id: target.id,
+						title: target.title,
+						mode: target.mode,
+						payload: target.payload,
+						urgency: target.urgency,
+						fireAtMs,
+					},
+					trigger: "manual",
+					utcOffsetMinutes: this.#utcOffsetMinutes,
+					telemetry: this.#telemetry ?? context.telemetry,
+					getRootConversation: async () => this.#root,
+					readAssistantText: async (entryId, ctx) => {
+						const ansEntry = await this.#root.commit((tx) => tx.entry(AssistantEntry, entryId), ctx);
+						const msg = ansEntry?.model?.[0];
+						return msg?.role === "assistant" ? extractAssistantText(msg) : "";
+					},
+					onDirectNotify: async (event) => {
+						for (const listener of this.#directNotifyListeners) {
+							await listener(event);
+						}
+					},
+					onAgentProactiveReply: async (replyText, answerEntryId, urgency) => {
+						for (const listener of this.#proactiveListeners) {
+							await listener(replyText, answerEntryId, { urgency });
+						}
+					},
+				},
+				context,
+			);
+		} finally {
+			endDispatch();
+		}
+	}
+
+	/** Reads the persisted last active owner delivery route (`LastRouteDoc`), if any. */
+	async getLastActiveRoute(context: Context): Promise<ChannelRoute | undefined> {
+		const doc = await this.#harness.snapshot(LastRouteDoc, context);
+		if (doc?.channel === undefined || doc.chatId === undefined) return undefined;
+		return { channel: doc.channel, chatId: doc.chatId };
+	}
+
+	/** Persists the owner's last active `{ channel, chatId }` delivery route into `LastRouteDoc`. */
+	async setLastActiveRoute(route: ChannelRoute, context: Context): Promise<void> {
+		const nowMs = this.#now();
+		await this.#root.commit(async (tx) => {
+			const doc = await tx.doc(LastRouteDoc);
+			doc.channel = route.channel;
+			doc.chatId = route.chatId;
+			doc.updatedAtMs = nowMs;
+		}, context);
+	}
+
+	/**
+	 * Waits until the single-flight routine scheduler finishes its scheduled wave:
+	 * - When only `once` routines are scheduled, awaits task termination (`waitForTask`);
+	 * - When recurring routines exist, awaits the next firing cycle without hanging on future slots.
+	 */
+	async waitForRoutineScheduler(context: Context): Promise<void> {
+		const state = await this.#harness.snapshot(RoutineDoc, context);
+		if (state?.scheduledTaskId === undefined) {
+			await this.#routineTracker.waitForCurrentDispatch();
+			await this.#root.waitForIdle(context);
+			return;
+		}
+		const enabled = Object.values(state.items).filter((item) => item.enabled && item.nextRunAtMs !== undefined);
+		const hasRecurring = enabled.some((item) => item.schedule.kind !== "once");
+		if (!hasRecurring) {
+			await this.#harness.waitForTask(state.scheduledTaskId as TaskId<null>, context);
+			await this.#routineTracker.waitForCurrentDispatch();
+			await this.#root.waitForIdle(context);
+			return;
+		}
+		const initialRuns = Object.values(state.items).reduce((sum, item) => sum + item.runCount, 0);
+		while (!context.abortSignal?.aborted) {
+			await this.#routineTracker.waitForCurrentDispatch();
+			const current = await this.#harness.snapshot(RoutineDoc, context);
+			const currentRuns = Object.values(current?.items ?? {}).reduce((sum, item) => sum + item.runCount, 0);
+			if (current?.scheduledTaskId === undefined || currentRuns > initialRuns) {
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 15));
+		}
+		await this.#routineTracker.waitForCurrentDispatch();
+		await this.#root.waitForIdle(context);
+	}
+
+	/**
+	 * Waits until all currently due routine dispatches and active foreground/background work triggered by an alarm
+	 * have settled, without blocking on future recurring slots. Designed for Cloudflare DO `alarm()` `ctx.waitUntil`.
+	 */
+	async waitForDueRoutines(context: Context): Promise<void> {
+		await Promise.resolve();
+		const deadline = Date.now() + 25_000;
+		while (!context.abortSignal?.aborted && Date.now() < deadline) {
+			await this.#routineTracker.waitForCurrentDispatch();
+			await this.#root.waitForIdle(context);
+			const state = await this.#harness.snapshot(RoutineDoc, context);
+			const nowMs = this.#now();
+			const hasDueNow = Object.values(state?.items ?? {}).some(
+				(item) => item.enabled && item.nextRunAtMs !== undefined && item.nextRunAtMs <= nowMs + 250,
+			);
+			if (!hasDueNow && !this.#routineTracker.isDispatching() && !this.#harness.wake().active) {
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		await this.#routineTracker.waitForCurrentDispatch();
+		await this.#root.waitForIdle(context);
 	}
 
 	/** Subscribes to newly created pending write-approval tickets requiring owner confirmation. */

@@ -191,6 +191,9 @@ export async function assembleNodeRuntime(
 			instructions: config.instructions,
 			memory,
 			handoff: config.handoff,
+			utcOffsetMinutes: config.utcOffsetMinutes,
+			enableRoutines: true,
+			autoResume: false,
 			...(mcp !== undefined ? { mcp } : {}),
 			...(workshop !== undefined ? { workshop } : {}),
 		},
@@ -211,6 +214,8 @@ export async function assembleNodeRuntime(
 	if (config.telegram !== undefined) {
 		gateway.registerTransport(new TelegramTransport({ botToken: config.telegram.botToken }));
 	}
+	// Resume durable background tasks only after gateway listeners and transports are wired.
+	host.resume();
 
 	return {
 		host,

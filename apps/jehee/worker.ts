@@ -167,6 +167,9 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 					instructions: config.instructions,
 					memory,
 					handoff: config.handoff,
+					utcOffsetMinutes: config.utcOffsetMinutes,
+					enableRoutines: true,
+					autoResume: false,
 					...(workerMcp !== undefined ? { mcp: workerMcp } : {}),
 					...(workshop !== undefined ? { workshop } : {}),
 					onWake: (wake) => {
@@ -215,10 +218,20 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 		return new Response("Not Found", { status: 404 });
 	}
 
-	/** Resumes due sleeps and unfinished background tasks when the Durable Object Alarm fires. */
+	/** Resumes due sleeps and unfinished background tasks when the Durable Object Alarm fires, guarding completion via `waitUntil`. */
 	async alarm(): Promise<void> {
 		await this.#armAlarm({ ...this.#host.wake(), active: true });
 		this.#host.resume();
+		this.#state.waitUntil(
+			(async () => {
+				try {
+					await this.#host.waitForDueRoutines(BACKGROUND_CONTEXT);
+					await this.#gateway.drain();
+				} finally {
+					await this.#armAlarm(this.#host.wake());
+				}
+			})(),
+		);
 	}
 
 	async #armAlarm(wake: Wake): Promise<void> {

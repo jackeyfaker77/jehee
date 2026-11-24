@@ -1,13 +1,18 @@
 // Public entry point of @jehee/bot.
 
 export {
+	type ChannelAttachment,
+	type ChannelAttachmentKind,
 	type ChannelInlineButton,
 	type ChannelRoute,
 	type ChannelSendOptions,
 	type ChannelTransport,
+	type DownloadedChannelFile,
 	formatRouteKey,
 	type InboundCallbackAction,
 	type InboundChannelMessage,
+	type OutboundDocumentPayload,
+	type OutboundPhotoPayload,
 } from "./channels/contract.ts";
 export {
 	type AdmittedIngest,
@@ -18,15 +23,24 @@ export {
 	type IngestResult,
 } from "./channels/gateway.ts";
 export {
+	DEFAULT_ATTACHMENT_TEXT_EXCERPT_CHARS,
+	type FormattedInboundAttachments,
+	formatInboundAttachmentsContext,
 	handleTelegramWebhook,
 	parseTelegramCallback,
 	parseTelegramUpdate,
 	pollTelegramUpdatesOnce,
 	splitTelegramText,
+	TELEGRAM_DEFAULT_MAX_DOWNLOAD_BYTES,
+	TELEGRAM_MAX_CAPTION_LENGTH,
 	TELEGRAM_MAX_MESSAGE_LENGTH,
+	type TelegramAudio,
+	type TelegramDocument,
+	type TelegramPhotoSize,
 	TelegramTransport,
 	type TelegramTransportOptions,
 	type TelegramUpdate,
+	type TelegramVoice,
 	verifyTelegramSecretToken,
 } from "./channels/telegram.ts";
 export { HandoffDoc } from "./context/durable-store.ts";
@@ -241,6 +255,65 @@ export {
 	serializePortableSnapshotJson,
 } from "./memory/portable-snapshot.ts";
 export { type StaticCoreMemoryOptions, StaticCoreMemoryProvider } from "./memory/static-core.ts";
+export type {
+	DirectNotifyEvent,
+	DirectNotifyListener,
+	LastRouteState,
+	RoutineCreateInput,
+	RoutineCreateResult,
+	RoutineDeleteResult,
+	RoutineItem,
+	RoutineMode,
+	RoutineRunOutcome,
+	RoutineSchedule,
+	RoutineStoreState,
+	RoutineUrgency,
+} from "./routines/contract.ts";
+export { LastRouteDoc, RoutineDoc } from "./routines/durable-store.ts";
+export {
+	attachUserClockAnchors,
+	type CreateRoutineSchedulerTaskOptions,
+	type CreateRoutinesExtensionOptions,
+	createRoutineSchedulerTask,
+	createRoutineSchedulerTracker,
+	createRoutinesExtension,
+	type DispatchRoutineInput,
+	dispatchRoutineExecution,
+	JEHEE_ROUTINES_EXTENSION_HANDLE,
+	JEHEE_ROUTINES_EXTENSION_NAME,
+	ROUTINE_CREATE_TOOL,
+	ROUTINE_DELETE_TOOL,
+	ROUTINE_LIST_TOOL,
+	type RoutineSchedulerTaskToken,
+	type RoutineSchedulerTracker,
+	RoutineWakeSignal,
+	syncRoutineSchedulerInTx,
+} from "./routines/extension.ts";
+export {
+	buildRoutineAgentPrompt,
+	claimDueRoutinesInState,
+	cloneRoutineItem,
+	computeNextRunAtMs,
+	createEmptyLastRouteState,
+	createEmptyRoutineStoreState,
+	createRoutineInState,
+	DEFAULT_UTC_OFFSET_MINUTES,
+	deleteRoutineInState,
+	findEarliestNextRunAtMs,
+	formatLocalClockLine,
+	formatLocalDateTime,
+	formatRoutineDeleteReply,
+	formatRoutineListReply,
+	formatRoutineRunReply,
+	formatScheduleDescription,
+	formatUtcOffset,
+	LOCAL_CLOCK_LINE_PREFIX,
+	listRoutinesFromState,
+	MIN_ROUTINE_INTERVAL_MS,
+	parseIsoTimestampMs,
+	parseTimeOfDay,
+	validateRoutineSchedule,
+} from "./routines/scheduler.ts";
 export { type JeheeRuntimeConfig, parseJeheeEnvConfig } from "./runtime/config.ts";
 export {
 	createJeheeModels,
@@ -267,13 +340,37 @@ export {
 	JEHEE_CONTEXT_TELEMETRY_SCHEMA,
 	JEHEE_MCP_TELEMETRY_SCHEMA,
 	JEHEE_MEMORY_TELEMETRY_SCHEMA,
+	JEHEE_ROUTINE_TELEMETRY_SCHEMA,
 	type JeheePostmortemReport,
 	type JeheeTraceMetrics,
 	JeheeTraceRecorder,
 	startJeheeContextSpan,
 	startJeheeMcpSpan,
 	startJeheeMemorySpan,
+	startJeheeRoutineSpan,
 } from "./telemetry/recorder.ts";
+export {
+	type CreateWebExtensionOptions,
+	createWebExtension,
+	JEHEE_WEB_EXTENSION_HANDLE,
+	JEHEE_WEB_EXTENSION_NAME,
+	WEB_FETCH_TOOL,
+} from "./web/extension.ts";
+export {
+	DEFAULT_WEB_FETCH_MAX_BYTES,
+	DEFAULT_WEB_FETCH_MAX_CHARS,
+	DEFAULT_WEB_FETCH_MAX_REDIRECTS,
+	DEFAULT_WEB_FETCH_TIMEOUT_MS,
+	type ExtractedWebContent,
+	extractReadableWebText,
+	fetchWebPage,
+	MAX_WEB_FETCH_BYTES_CAP,
+	MAX_WEB_FETCH_CHARS_CAP,
+	type UrlValidationResult,
+	validatePublicHttpUrl,
+	type WebFetchOptions,
+	type WebFetchResult,
+} from "./web/web-fetch.ts";
 export {
 	buildGitSummaryBlock,
 	filterGitStatusShortLines,

@@ -13,6 +13,42 @@ export type ChannelInlineButton = {
 	readonly callbackData: string;
 };
 
+/** Media category for a normalized inbound channel attachment. */
+export type ChannelAttachmentKind = "image" | "document" | "audio" | "voice";
+
+/** Normalized inbound media attachment metadata extracted from a messaging connector payload. */
+export type ChannelAttachment = {
+	readonly kind: ChannelAttachmentKind;
+	readonly fileId: string;
+	readonly mimeType?: string;
+	readonly fileName?: string;
+	readonly sizeBytes?: number;
+	readonly durationSeconds?: number;
+};
+
+/** Raw bytes and normalized metadata returned by `ChannelTransport.downloadFile`. */
+export type DownloadedChannelFile = {
+	readonly bytes: Uint8Array;
+	readonly mimeType: string;
+	readonly fileName?: string;
+};
+
+/** Outbound image payload delivered through `ChannelTransport.sendPhoto`. */
+export type OutboundPhotoPayload = {
+	readonly bytes: Uint8Array;
+	readonly mimeType: string;
+	readonly fileName?: string;
+	readonly caption?: string;
+};
+
+/** Outbound document payload delivered through `ChannelTransport.sendDocument`. */
+export type OutboundDocumentPayload = {
+	readonly bytes: Uint8Array;
+	readonly mimeType: string;
+	readonly fileName: string;
+	readonly caption?: string;
+};
+
 /** Normalized inbound user message delivered by any messaging connector. */
 export type InboundChannelMessage = {
 	readonly channel: string;
@@ -21,6 +57,7 @@ export type InboundChannelMessage = {
 	readonly messageId: string;
 	readonly text: string;
 	readonly timestampMs: number;
+	readonly attachments?: readonly ChannelAttachment[];
 };
 
 /** Normalized inbound button/callback interaction (e.g. Telegram `callback_query`). */
@@ -47,6 +84,9 @@ export interface ChannelTransport {
 	sendText(chatId: string, text: string, options?: ChannelSendOptions): Promise<void>;
 	sendTyping?(chatId: string): Promise<void>;
 	answerCallback?(callbackId: string, text?: string): Promise<void>;
+	downloadFile?(fileId: string, maxBytes?: number): Promise<DownloadedChannelFile>;
+	sendPhoto?(chatId: string, photo: OutboundPhotoPayload, options?: ChannelSendOptions): Promise<void>;
+	sendDocument?(chatId: string, doc: OutboundDocumentPayload, options?: ChannelSendOptions): Promise<void>;
 }
 
 /** Formats a canonical `"<channel>:<chatId>"` route key for allowlists and staging guards. */

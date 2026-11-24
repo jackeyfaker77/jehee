@@ -19,6 +19,7 @@ declare module "cloudflare:workers" {
 	export type DurableObjectState = {
 		readonly storage: DurableObjectStorage;
 		blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
+		waitUntil(promise: Promise<unknown>): void;
 		abort(reason?: string): void;
 	};
 

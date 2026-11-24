@@ -312,6 +312,54 @@ export function startJeheeContextSpan(
 	return createTypedSpanStarter(telemetry, [JEHEE_CONTEXT_TELEMETRY_SCHEMA]);
 }
 
+/** Telemetry span vocabulary emitted by Jehee's Slice 6A proactive routines scheduler. */
+export const JEHEE_ROUTINE_TELEMETRY_SCHEMA = defineTelemetrySchema({
+	version: 1,
+	spans: {
+		"jehee.routine.fire": {
+			description: "One scheduled or manually triggered routine firing (direct_notify or agent_prompt).",
+			parents: { kind: "any" },
+			startAttributes: {
+				"routine.id": { type: "string", required: true, description: "Routine item ID (e.g. rtn_0001)." },
+				"routine.mode": {
+					type: "string",
+					required: true,
+					values: ["direct_notify", "agent_prompt"],
+					description: "Dispatch execution mode for the routine.",
+				},
+				"routine.trigger": {
+					type: "string",
+					required: true,
+					values: ["scheduled", "manual"],
+					description: "Whether fired by the durable scheduler timer or manual /routines run.",
+				},
+			},
+			endAttributes: {
+				"routine.fire_at_ms": { type: "number", description: "Scheduled or manual firing timestamp in epoch ms." },
+				"routine.suppressed_silent": {
+					type: "boolean",
+					description: "Whether an agent_prompt routine replied [SILENT] and suppressed outbound delivery.",
+				},
+				"routine.outcome": {
+					type: "string",
+					description: "Result status (ok / silent / error / not_found).",
+				},
+			},
+			status: {
+				default: "ok",
+				errorWhen: "Routine dispatch failed or agent turn settled unanswered.",
+			},
+		},
+	},
+});
+
+/** Bound typed span starter for Jehee proactive routine firing spans. */
+export function startJeheeRoutineSpan(
+	telemetry: TelemetryContext,
+): TypedSpanStarter<readonly [typeof JEHEE_ROUTINE_TELEMETRY_SCHEMA]> {
+	return createTypedSpanStarter(telemetry, [JEHEE_ROUTINE_TELEMETRY_SCHEMA]);
+}
+
 function numAttr(span: StoredSpan, key: string): number {
 	const val = span.attributes[key];
 	return typeof val === "number" && Number.isFinite(val) ? val : 0;

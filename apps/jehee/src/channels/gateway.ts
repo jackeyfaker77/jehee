@@ -2,7 +2,8 @@
 // deterministic slash commands (/status, /stop, /approve, /reject, /flush), inline button callbacks, proactive quiet
 // governance ("It knows when to be quiet"), busy-turn steering, and cross-platform root-session continuity.
 
-import type { Context } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatHandoffReply } from "../context/handoff.ts";
 import type { JeheeHost, JeheePendingTurn } from "../core/host.ts";
 import type { ApprovalTicket } from "../governance/approvals.ts";
@@ -10,15 +11,19 @@ import { ProactiveNotificationGovernor, type ProactiveQuietPolicy } from "../gov
 import { formatMemoryInspectReply, formatMemorySearchReply } from "../memory/atomic-memory.ts";
 import { formatConsolidationReportReply } from "../memory/consolidator.ts";
 import { renderPortableSnapshotMarkdown, serializePortableSnapshotJson } from "../memory/portable-snapshot.ts";
+import { formatRoutineDeleteReply, formatRoutineListReply, formatRoutineRunReply } from "../routines/scheduler.ts";
 import { formatTraceDetailReply, formatTraceListReply } from "../telemetry/durable-store.ts";
 import {
+	type ChannelAttachment,
 	type ChannelRoute,
 	type ChannelSendOptions,
 	type ChannelTransport,
+	type DownloadedChannelFile,
 	formatRouteKey,
 	type InboundCallbackAction,
 	type InboundChannelMessage,
 } from "./contract.ts";
+import { formatInboundAttachmentsContext } from "./telegram.ts";
 
 /** Per-channel allowlist mapping channel names (e.g. `"telegram"`, `"qq"`) to authorized owner sender IDs. */
 export type ChannelAllowlist = Readonly<Record<string, readonly string[]>>;
@@ -38,7 +43,16 @@ export type ChannelGatewayOptions = {
 };
 
 /** Deterministic slash commands handled directly by `ChannelGateway`. */
-export type GatewaySlashCommand = "status" | "stop" | "approve" | "reject" | "flush" | "memory" | "handoff" | "trace";
+export type GatewaySlashCommand =
+	| "status"
+	| "stop"
+	| "approve"
+	| "reject"
+	| "flush"
+	| "memory"
+	| "handoff"
+	| "trace"
+	| "routines";
 
 /** Outcome reported after ingesting or flushing an inbound message or button callback. */
 export type IngestResult =
@@ -58,6 +72,7 @@ type CoalesceBucket = {
 	readonly chatId: string;
 	readonly firstMessageId: string;
 	readonly texts: string[];
+	readonly attachments: ChannelAttachment[];
 	readonly resolvers: Array<(result: IngestResult) => void>;
 	readonly rejecters: Array<(error: unknown) => void>;
 	timer: ReturnType<typeof setTimeout> | undefined;
@@ -87,6 +102,10 @@ function parseSlashCommand(trimmed: string): { readonly cmd: GatewaySlashCommand
 		const arg = trimmed.slice("/trace".length).trim();
 		return arg.length > 0 ? { cmd: "trace", arg } : { cmd: "trace" };
 	}
+	if (trimmed === "/routines" || trimmed.startsWith("/routines ")) {
+		const arg = trimmed.slice("/routines".length).trim();
+		return arg.length > 0 ? { cmd: "routines", arg } : { cmd: "routines" };
+	}
 	return undefined;
 }
 
@@ -110,7 +129,9 @@ export class ChannelGateway {
 	readonly #buckets = new Map<string, CoalesceBucket>();
 	readonly #inFlight = new Set<Promise<unknown>>();
 	readonly #deliveredAnswerIds = new Set<number>();
+	readonly #deliveredDirectKeys = new Set<string>();
 	readonly #unsubscribeProactive: () => void;
+	readonly #unsubscribeDirectNotify: () => void;
 	readonly #unsubscribeApproval: () => void;
 	#lastActiveRoute: ChannelRoute | undefined;
 	#blockedStagingDeliveries = 0;
@@ -127,18 +148,34 @@ export class ChannelGateway {
 		this.#governor = new ProactiveNotificationGovernor(options.quietPolicy);
 		this.#now = options.now ?? Date.now;
 
-		this.#unsubscribeProactive = this.#host.onProactiveReply(async (replyText, answerEntryId) => {
+		this.#unsubscribeProactive = this.#host.onProactiveReply(async (replyText, answerEntryId, opts) => {
 			const numericAnswerId = Number(answerEntryId);
 			if (this.#deliveredAnswerIds.has(numericAnswerId)) return;
-			if (this.#lastActiveRoute !== undefined) {
-				this.#deliveredAnswerIds.add(numericAnswerId);
-				await this.pushMessage(this.#lastActiveRoute, replyText);
+			// Claim synchronously before any await so coalesced concurrent reporters cannot race past dedup.
+			this.#deliveredAnswerIds.add(numericAnswerId);
+			const route = await this.#resolveProactiveRoute(BACKGROUND_CONTEXT);
+			if (route === undefined) {
+				this.#deliveredAnswerIds.delete(numericAnswerId);
+				return;
 			}
+			await this.pushMessage(route, replyText, opts?.urgency !== undefined ? { urgency: opts.urgency } : undefined);
+		});
+
+		this.#unsubscribeDirectNotify = this.#host.onDirectNotify(async (event) => {
+			if (this.#deliveredDirectKeys.has(event.dedupeKey)) return;
+			this.#deliveredDirectKeys.add(event.dedupeKey);
+			const route = await this.#resolveProactiveRoute(BACKGROUND_CONTEXT);
+			if (route === undefined) {
+				this.#deliveredDirectKeys.delete(event.dedupeKey);
+				return;
+			}
+			await this.pushMessage(route, event.text, { urgency: event.urgency });
 		});
 
 		this.#unsubscribeApproval = this.#host.onApprovalRequested(async (ticket) => {
-			if (this.#lastActiveRoute === undefined) return;
-			await this.pushMessage(this.#lastActiveRoute, formatApprovalPromptCard(ticket), {
+			const route = await this.#resolveProactiveRoute(BACKGROUND_CONTEXT);
+			if (route === undefined) return;
+			await this.pushMessage(route, formatApprovalPromptCard(ticket), {
 				urgency: "urgent",
 				buttons: [
 					[
@@ -177,11 +214,13 @@ export class ChannelGateway {
 			return { settled: Promise.resolve({ kind: "unauthorized" }) };
 		}
 		const trimmed = message.text.trim();
-		if (trimmed.length === 0) {
+		const hasAttachments = message.attachments !== undefined && message.attachments.length > 0;
+		if (trimmed.length === 0 && !hasAttachments) {
 			return { settled: Promise.resolve({ kind: "ignored_empty" }) };
 		}
 		const route: ChannelRoute = { channel: message.channel, chatId: message.chatId };
 		this.#lastActiveRoute = route;
+		await this.#host.setLastActiveRoute(route, context);
 
 		const parsedCmd = parseSlashCommand(trimmed);
 		if (parsedCmd !== undefined) {
@@ -202,6 +241,7 @@ export class ChannelGateway {
 					requestId: `${message.channel}:${message.chatId}:${message.messageId}`,
 					replyToMessageId: message.messageId,
 					text: trimmed,
+					...(hasAttachments ? { attachments: message.attachments } : {}),
 					whenBusy: "steer",
 				},
 				context,
@@ -216,6 +256,7 @@ export class ChannelGateway {
 					requestId: `${message.channel}:${message.chatId}:${message.messageId}`,
 					replyToMessageId: message.messageId,
 					text: trimmed,
+					...(hasAttachments ? { attachments: message.attachments } : {}),
 				},
 				context,
 			);
@@ -238,7 +279,9 @@ export class ChannelGateway {
 			await transport?.answerCallback?.(callback.callbackId, "未授权操作");
 			return { settled: Promise.resolve({ kind: "unauthorized" }) };
 		}
-		this.#lastActiveRoute = { channel: callback.channel, chatId: callback.chatId };
+		const callbackRoute: ChannelRoute = { channel: callback.channel, chatId: callback.chatId };
+		this.#lastActiveRoute = callbackRoute;
+		await this.#host.setLastActiveRoute(callbackRoute, context);
 
 		if (callback.data.startsWith("apv:ok:") || callback.data.startsWith("apv:no:")) {
 			const isApprove = callback.data.startsWith("apv:ok:");
@@ -321,8 +364,28 @@ export class ChannelGateway {
 	/** Cancels any pending debounce timers and detaches background listeners cleanly during shutdown. */
 	dispose(): void {
 		this.#unsubscribeProactive();
+		this.#unsubscribeDirectNotify();
 		this.#unsubscribeApproval();
 		this.#cancelAllBuckets("disposed");
+	}
+
+	async #resolveProactiveRoute(context: Context): Promise<ChannelRoute | undefined> {
+		if (this.#lastActiveRoute !== undefined) {
+			return this.#lastActiveRoute;
+		}
+		const persisted = await this.#host.getLastActiveRoute(context);
+		if (persisted !== undefined && this.#transports.has(persisted.channel)) {
+			this.#lastActiveRoute = persisted;
+			return persisted;
+		}
+		const tgAllow = this.#allowFrom.get("telegram");
+		if (tgAllow !== undefined && tgAllow.size > 0 && this.#transports.has("telegram")) {
+			const firstOwner = tgAllow.values().next().value;
+			if (firstOwner !== undefined) {
+				return { channel: "telegram", chatId: firstOwner };
+			}
+		}
+		return persisted;
 	}
 
 	#cancelAllBuckets(reason: string): void {
@@ -419,11 +482,16 @@ export class ChannelGateway {
 			return { settled: Promise.resolve({ kind: "command_handled", command: "trace" }) };
 		}
 
+		if (cmd === "routines") {
+			return this.#handleRoutinesCommand(arg, message, context);
+		}
+
 		const busy = await this.#host.isBusy(context);
 		const memoryId = this.#host.memoryProvider?.id ?? "none";
 		const mcpServers = this.#host.mcpServerNames;
 		const mcpLabel = mcpServers.length > 0 ? mcpServers.join(", ") : "none";
 		const pendingApprovals = await this.#host.listPendingApprovals(context);
+		const activeRoutines = await this.#host.listRoutines(context);
 		const contextStatus = await this.#host.getContextStatus(context);
 		const usage = await this.#host.getUsageSummary(context);
 		const cachePct = (usage.cacheHitRate * 100).toFixed(1);
@@ -434,6 +502,7 @@ export class ChannelGateway {
 			`memory: ${memoryId}`,
 			`context: ${contextStatus.activeTokens}/${sweetSpotLabel} tok (handoffs=${contextStatus.totalHandoffs})`,
 			`mcp: ${mcpLabel}`,
+			`routines: ${activeRoutines.length}`,
 			`pending_approvals: ${pendingApprovals.length}`,
 			`held_proactive: ${this.#governor.heldCount}`,
 			`cache_hit: ${cachePct}% (prefill=${usage.prefillTokens})`,
@@ -443,6 +512,54 @@ export class ChannelGateway {
 			replyToMessageId: message.messageId,
 		});
 		return { settled: Promise.resolve({ kind: "command_handled", command: "status" }) };
+	}
+
+	async #handleRoutinesCommand(
+		arg: string | undefined,
+		message: InboundChannelMessage,
+		context: Context,
+	): Promise<AdmittedIngest> {
+		const sendOpts: ChannelSendOptions = { replyToMessageId: message.messageId };
+		const trimmed = arg?.trim() ?? "";
+
+		if (trimmed.length === 0 || trimmed.toLowerCase() === "list") {
+			const items = await this.#host.listRoutines(context);
+			const reply = formatRoutineListReply(items, this.#host.utcOffsetMinutes);
+			await this.#deliverOutbound(message.channel, message.chatId, reply, sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "routines" }) };
+		}
+
+		const spaceIdx = trimmed.indexOf(" ");
+		const sub = (spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx)).toLowerCase();
+		const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+
+		if (sub === "cancel" || sub === "delete") {
+			if (rest.length === 0) {
+				await this.#deliverOutbound(message.channel, message.chatId, "用法：/routines cancel <id>", sendOpts);
+				return { settled: Promise.resolve({ kind: "command_handled", command: "routines" }) };
+			}
+			const deleted = await this.#host.deleteRoutine(rest, context);
+			await this.#deliverOutbound(message.channel, message.chatId, formatRoutineDeleteReply(deleted), sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "routines" }) };
+		}
+
+		if (sub === "run") {
+			if (rest.length === 0) {
+				await this.#deliverOutbound(message.channel, message.chatId, "用法：/routines run <id>", sendOpts);
+				return { settled: Promise.resolve({ kind: "command_handled", command: "routines" }) };
+			}
+			const outcome = await this.#host.runRoutineNow(rest, context);
+			await this.#deliverOutbound(message.channel, message.chatId, formatRoutineRunReply(outcome), sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "routines" }) };
+		}
+
+		await this.#deliverOutbound(
+			message.channel,
+			message.chatId,
+			"用法：/routines [list | cancel <id> | run <id>]",
+			sendOpts,
+		);
+		return { settled: Promise.resolve({ kind: "command_handled", command: "routines" }) };
 	}
 
 	async #handleMemoryCommand(
@@ -640,13 +757,19 @@ export class ChannelGateway {
 				chatId: message.chatId,
 				firstMessageId: message.messageId,
 				texts: [],
+				attachments: [],
 				resolvers: [],
 				rejecters: [],
 				timer: undefined,
 			};
 			this.#buckets.set(routeKey, bucket);
 		}
-		bucket.texts.push(trimmedText);
+		if (trimmedText.length > 0) {
+			bucket.texts.push(trimmedText);
+		}
+		if (message.attachments !== undefined && message.attachments.length > 0) {
+			bucket.attachments.push(...message.attachments);
+		}
 		if (bucket.timer !== undefined) {
 			clearTimeout(bucket.timer);
 		}
@@ -678,6 +801,7 @@ export class ChannelGateway {
 				requestId: `${bucket.channel}:${bucket.chatId}:${bucket.firstMessageId}`,
 				replyToMessageId: bucket.firstMessageId,
 				text: mergedText,
+				...(bucket.attachments.length > 0 ? { attachments: bucket.attachments } : {}),
 				...(busyNow ? { whenBusy: "steer" } : {}),
 			},
 			context,
@@ -692,13 +816,53 @@ export class ChannelGateway {
 			readonly requestId: string;
 			readonly replyToMessageId: string;
 			readonly text: string;
+			readonly attachments?: readonly ChannelAttachment[];
 			readonly whenBusy?: "steer" | "followUp";
 		},
 		context: Context,
 	): Promise<AdmittedIngest> {
+		let textToSubmit = params.text;
+		let images: readonly ImageContent[] | undefined;
+
+		if (params.attachments !== undefined && params.attachments.length > 0) {
+			const transport = this.#transports.get(params.channel);
+			const downloaded = new Map<string, DownloadedChannelFile>();
+			const failedIds = new Set<string>();
+			const failedNotes: string[] = [];
+
+			if (transport?.downloadFile !== undefined) {
+				for (const att of params.attachments) {
+					if (att.kind === "voice" || att.kind === "audio") continue;
+					try {
+						const file = await transport.downloadFile(att.fileId);
+						downloaded.set(att.fileId, file);
+					} catch (error) {
+						failedIds.add(att.fileId);
+						const reason = error instanceof Error ? error.message : String(error);
+						failedNotes.push(
+							`[Attachment download failed (${att.kind}): ${att.fileName ?? att.fileId} — ${reason}]`,
+						);
+					}
+				}
+			}
+
+			const remaining =
+				failedIds.size > 0 ? params.attachments.filter((att) => !failedIds.has(att.fileId)) : params.attachments;
+			const formatted = formatInboundAttachmentsContext(remaining, downloaded);
+			const allNotes = [...formatted.textNotes, ...failedNotes];
+			const textAppendix = allNotes.join("\n\n");
+			if (textAppendix.length > 0) {
+				textToSubmit = textToSubmit.length > 0 ? `${textToSubmit}\n\n${textAppendix}` : textAppendix;
+			}
+			if (formatted.images.length > 0) {
+				images = formatted.images;
+			}
+		}
+
 		const pending = await this.#host.submitMessage(
 			{
-				text: params.text,
+				text: textToSubmit,
+				...(images !== undefined ? { images } : {}),
 				requestId: params.requestId,
 				...(params.whenBusy !== undefined ? { whenBusy: params.whenBusy } : {}),
 			},

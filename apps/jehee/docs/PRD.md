@@ -2,8 +2,8 @@
 
 - **产品名称**：Jehee
 - **产品形态**：7×24 小时常驻个人伙伴型 Bot（Always-on Personal Colleague）
-- **文档状态**：Active（随各垂直切片演进同步更新，v1.5）
-- **更新日期**：2026-11-24
+- **文档状态**：Active（随各垂直切片演进同步更新，v1.6）
+- **更新日期**：2026-11-25
 
 ---
 
@@ -88,3 +88,5 @@
 | **Slice 5C-2（已完成）** | **后台空闲/定时异步记忆整理（去重、冲突消解与隐性事实提炼）** | 基于 `MemoryConsolidationDoc` 增量水位线、`pi-durable` 单活空闲休眠任务、严格 JSON Patch 确定性应用器（墓碑可逆恢复）与 `/memory consolidate` 白名单指令，三臂 `Eval-0002` 对比达 `100%`（vs 5C-1 `57.1%` / 基线 `14.3%`）。 |
 | **Slice 5C-3（已完成）** | **上下文与记忆的可移植快照（Portable Export / Import）** | 定义 Harness 与模型无关的 `jehee.portable.snapshot` v1 格式（无损 JSON + Markdown 视图），支持 `JeheeHost` 跨宿主/换模型无损迁移与 `merge`/`replace` 原子导入、CLI `export`/`import` 及 `/memory export` 白名单指令。 |
 | **Slice 5D（已完成）** | **单窗口无感换窗（Seamless Handoff）、换窗前记忆落盘与底层原话回查（`Eval-0003`）** | 基于 `pi-durable` 原生 `CompactionTask` + `Conversation.reset(handoff)` 实现甜点水位（`48K`）自动压缩与 `/handoff [focus]` 显式换窗，`beforeCompact` 先自动落盘 5C-2 原子记忆，提供跨换窗 `history_search` 逐字原话回查（工坊隔离），与 5C-3 可移植快照无缝兼容，并通过 `Eval-0003` 离线与真机双轨 `100%` 验收。 |
+| **Slice 6A（已完成）** | **主动定时提醒、周期例行任务、用户侧本地时钟锚点、持久化投递路由与 DO Alarm 守护（`ADR-0014`）** | 基于单活 `RoutineSchedulerTask` + `RoutineWakeSignal` 与 `RoutineDoc` / `LastRouteDoc` 实现 `once`/`daily`/`weekly`/`interval` 定时任务、`direct_notify` 零 Token 直推与 `agent_prompt` `[SILENT]` 静默抑制、用户侧不可变 `[Local Time: ...]` 时钟锚点（零系统前缀 KV-Cache 破坏）、`/routines` 白名单指令、冷重启延迟 `autoResume` 保护与 Cloudflare DO `alarm()` `ctx.waitUntil` 守护。 |
+| **Slice 6B（已完成）** | **Telegram 多模态收发通道与防 SSRF 可移植 `web_fetch` 工具（`ADR-0015`）** | 扩展 `ChannelAttachment` / `downloadFile` / `sendPhoto` / `sendDocument` 多模态契约，打通无配文图片/文档经 `ChannelGateway`（直通、忙时插话与防抖合并全链路）自动下载并向模型交付 `ImageContent` 与有界文档摘录（单文件失败降级隔离）；内置双栖防 SSRF 只读 `web_fetch` 扩展（覆盖 IPv4/IPv6/重定向与工坊子会话隔离）。 |
