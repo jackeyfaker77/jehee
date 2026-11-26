@@ -49,6 +49,24 @@ export type OutboundDocumentPayload = {
 	readonly caption?: string;
 };
 
+/** Quoted or replied-to message metadata preserved from platforms such as Telegram (`reply_to_message` / `quote`). */
+export type InboundReplyContext = {
+	readonly messageId?: string;
+	readonly senderName?: string;
+	readonly isFromAssistant?: boolean;
+	readonly text?: string;
+	readonly isPartialQuote?: boolean;
+	readonly attachmentSummary?: string;
+};
+
+/** Forwarded message origin metadata preserved from platforms such as Telegram (`forward_origin`). */
+export type InboundForwardContext = {
+	readonly originType: "user" | "hidden_user" | "chat" | "channel";
+	readonly originLabel: string;
+	readonly authorSignature?: string;
+	readonly originalTimestampMs?: number;
+};
+
 /** Normalized inbound user message delivered by any messaging connector. */
 export type InboundChannelMessage = {
 	readonly channel: string;
@@ -58,6 +76,8 @@ export type InboundChannelMessage = {
 	readonly text: string;
 	readonly timestampMs: number;
 	readonly attachments?: readonly ChannelAttachment[];
+	readonly replyContext?: InboundReplyContext;
+	readonly forwardContext?: InboundForwardContext;
 };
 
 /** Normalized inbound button/callback interaction (e.g. Telegram `callback_query`). */

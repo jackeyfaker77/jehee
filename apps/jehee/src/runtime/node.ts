@@ -215,7 +215,9 @@ export async function assembleNodeRuntime(
 	});
 
 	if (config.telegram !== undefined) {
-		gateway.registerTransport(new TelegramTransport({ botToken: config.telegram.botToken }));
+		const telegramTransport = new TelegramTransport({ botToken: config.telegram.botToken });
+		gateway.registerTransport(telegramTransport);
+		void telegramTransport.setMyCommands().catch(() => undefined);
 	}
 	// Resume durable background tasks only after gateway listeners and transports are wired.
 	host.resume();

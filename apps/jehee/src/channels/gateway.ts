@@ -35,7 +35,7 @@ import {
 	type InboundCallbackAction,
 	type InboundChannelMessage,
 } from "./contract.ts";
-import { formatInboundAttachmentsContext } from "./telegram.ts";
+import { formatInboundAttachmentsContextAsync, formatInboundMessageContextPrefix } from "./telegram.ts";
 
 /** Per-channel allowlist mapping channel names (e.g. `"telegram"`, `"qq"`) to authorized owner sender IDs. */
 export type ChannelAllowlist = Readonly<Record<string, readonly string[]>>;
@@ -276,6 +276,10 @@ export class ChannelGateway {
 			}
 		}
 
+		const contextPrefix = formatInboundMessageContextPrefix(message);
+		const enrichedText =
+			contextPrefix !== undefined ? (trimmed.length > 0 ? `${contextPrefix}\n${trimmed}` : contextPrefix) : trimmed;
+
 		const busy = await this.#host.isBusy(context);
 		if (busy) {
 			return this.#admitTurn(
@@ -284,7 +288,7 @@ export class ChannelGateway {
 					chatId: message.chatId,
 					requestId: `${message.channel}:${message.chatId}:${message.messageId}`,
 					replyToMessageId: message.messageId,
-					text: trimmed,
+					text: enrichedText,
 					...(hasAttachments ? { attachments: message.attachments } : {}),
 					whenBusy: "steer",
 				},
@@ -299,14 +303,14 @@ export class ChannelGateway {
 					chatId: message.chatId,
 					requestId: `${message.channel}:${message.chatId}:${message.messageId}`,
 					replyToMessageId: message.messageId,
-					text: trimmed,
+					text: enrichedText,
 					...(hasAttachments ? { attachments: message.attachments } : {}),
 				},
 				context,
 			);
 		}
 
-		return { settled: this.#enqueueDebounced(message, trimmed, context) };
+		return { settled: this.#enqueueDebounced(message, enrichedText, context) };
 	}
 
 	/** Ingests one normalized platform message and waits until its turn (or command) has settled and replied. */
@@ -1097,7 +1101,7 @@ export class ChannelGateway {
 
 			const remaining =
 				failedIds.size > 0 ? params.attachments.filter((att) => !failedIds.has(att.fileId)) : params.attachments;
-			const formatted = formatInboundAttachmentsContext(remaining, downloaded);
+			const formatted = await formatInboundAttachmentsContextAsync(remaining, downloaded);
 			const allNotes = [...formatted.textNotes, ...failedNotes];
 			const textAppendix = allNotes.join("\n\n");
 			if (textAppendix.length > 0) {

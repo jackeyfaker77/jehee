@@ -60,6 +60,7 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [ADR-0015](./adr/0015-multimodal-channels-and-web-fetch.md) | Telegram 多模态收发通道与防 SSRF 可移植 `web_fetch` 工具（Slice 6B） | Accepted | 2026-11-25 | 扩展 `ChannelAttachment` / `downloadFile` / `sendPhoto` / `sendDocument` 多模态契约与 `ChannelGateway` 附件下载、防抖保留与 `ImageContent` 多段入站；实现双栖零 Node 依赖且覆盖 IPv4/IPv6/重定向的防 SSRF 只读 `web_fetch` 扩展与工坊子会话隔离。 |
 | [ADR-0016](./adr/0016-resilient-pa-ops-and-outbound-media.md) | 静默时段持久化自动补发、MCP 自愈重连、运行时模型热切与出站富媒体交付（Slice 6C） | Accepted | 2026-11-26 | 落地会话级 `HeldNotificationsDoc` 与单活调度器静默窗口结束自动补发、`/mcp` 脱敏失败诊断与 `/mcp reconnect` 原子热替换、`RuntimeModelDoc` 持久化 `/model` 热切，以及直连 `McpBlobVault` 的可移植 `send_media` 出站富媒体扩展与工坊子会话隔离。 |
 | [ADR-0017](./adr/0017-portable-web-search-tinyfish.md) | 可移植实时联网搜索 `web_search`（TinyFish TinySearch 首发接入，Slice 6D-1） | Accepted | 2026-11-27 | 在 `"jehee.web"` 扩展内新增零 Node 依赖的 TinyFish TinySearch `web_search` 工具（`X-API-Key` 鉴权、实网响应防御解析、`429` 限流与凭据脱敏、有界结果/摘要），与 `web_fetch` 拼齐「搜 → 读」闭环并自动继承工坊子会话隔离与稀疏首轮门禁。 |
+| [ADR-0018](./adr/0018-telegram-ux-and-portable-pdf.md) | Telegram 引用/转发上下文保留、`/` 指令菜单自动注册与可移植 PDF 文本读取（Slice 6D-2） | Accepted | 2026-11-27 | 保留 Telegram `reply_to_message`/局部 `quote` 与 4 类 `forward_origin` 上下文（不破坏斜杠指令）、启动自动非阻塞调用 `setMyCommands` 注册 11 条命令菜单，并实现零 Node 依赖的 FlateDecode + 字体级 `/ToUnicode` CMap PDF 文本提取器。 |
 
 ### 评测结论与失败复盘记录（Evals & Postmortems）
 
@@ -74,6 +75,7 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [Audit-0007](./evals/0007-slice-6a-6b-audit-and-postmortem.md) | Slice 6A + 6B 联合集成审计、全量门禁实测与 4 项审查缺陷复盘 | [ADR-0014](./adr/0014-proactive-routines-and-clock.md)–[0015](./adr/0015-multimodal-channels-and-web-fetch.md) | 2026-11-25 | 汇总 Slice 6A（主动 Routines + 本地时钟锚点 + DO Alarm 守护）与 Slice 6B（Telegram 多模态收发 + 防 SSRF `web_fetch`）全量门禁、单测、BDD 与四项离线 Eval 结果，并按四要素归档审校阶段捕获的 4 项真实缺陷（IPv6 SSRF 绕过、图片 MIME 优先级与 SVG 路由、冷启动提前 `resume` 丢提醒、瞬态出站异常击穿单活调度器）。 |
 | [Audit-0008](./evals/0008-slice-6c-audit-and-postmortem.md) | Slice 6C 联合集成审计、全量门禁实测与 5 项缺陷复盘 | [ADR-0016](./adr/0016-resilient-pa-ops-and-outbound-media.md) | 2026-11-27 | 汇总 Slice 6C（持久化静默自动补发、`/mcp` 自愈重连、持久化 `/model` 热切与 `send_media` 出站富媒体）全量门禁、单测、BDD 与四项离线 Eval 实测，并按四要素留痕 Windows `git worktree` `MAX_PATH` 限制、MCP 凭据脱敏补漏、`McpBlobVault`/`send_media` 安全加固、`RoutineSchedulerTask` 事务级唤醒竞态与 Windows `share` 工作树清理跨越 NTFS Junction 误删根工作区上游包恢复复盘。 |
 | [Audit-0009](./evals/0009-slice-6d-web-search-postmortem.md) | Slice 6D-1 `web_search`（TinyFish TinySearch）实网联调与问题复盘 | [ADR-0017](./adr/0017-portable-web-search-tinyfish.md) | 2026-11-27 | 记录 TinyFish TinySearch 实网 JSON 契约差异（缺顶层 `total_results`/`page` 且含混合格式 `date`）与嵌入式浏览器 Google OAuth 白屏复盘，并汇总全量门禁与线上 Telegram 真机联网搜索验收结果。 |
+| [Audit-0010](./evals/0010-slice-6d-2-telegram-pdf-postmortem.md) | Slice 6D-2 Telegram 引用/转发、`/` 指令菜单与可移植 PDF 读取验收复盘 | [ADR-0018](./adr/0018-telegram-ux-and-portable-pdf.md) | 2026-11-27 | 汇总 Telegram 引用回复/转发来源保留、`setMyCommands` 11 条指令自动注册与纯 Web 标准 PDF（FlateDecode + `/ToUnicode` CMap）提取全量门禁及线上实测，并留痕同步/异步附件边界与 PDF 尾部填充/多字体 CID 冲突防坑复盘。 |
 
 ---
 

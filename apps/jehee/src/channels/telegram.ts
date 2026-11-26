@@ -9,10 +9,13 @@ import type {
 	DownloadedChannelFile,
 	InboundCallbackAction,
 	InboundChannelMessage,
+	InboundForwardContext,
+	InboundReplyContext,
 	OutboundDocumentPayload,
 	OutboundPhotoPayload,
 } from "./contract.ts";
 import type { ChannelGateway } from "./gateway.ts";
+import { extractPdfText } from "./pdf-text.ts";
 
 /** Telegram's hard per-message limit in UTF-16 code units. */
 export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
@@ -25,6 +28,91 @@ export const TELEGRAM_DEFAULT_MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
 
 /** Default maximum characters emitted for decoded text document excerpts in `formatInboundAttachmentsContext`. */
 export const DEFAULT_ATTACHMENT_TEXT_EXCERPT_CHARS = 12_000;
+
+/** Default maximum characters preserved from a quoted/replied-to Telegram message excerpt. */
+export const MAX_REPLY_EXCERPT_CHARS = 1_500;
+
+/** Single Telegram Bot API slash command entry accepted by `/setMyCommands`. */
+export type TelegramBotCommand = {
+	readonly command: string;
+	readonly description: string;
+};
+
+/** Complete slash command menu registered by Jehee via Telegram's `setMyCommands` API. */
+export const JEHEE_TELEGRAM_COMMANDS: readonly TelegramBotCommand[] = [
+	{ command: "status", description: "查看运行状态、上下文水位、MCP与暂存队列" },
+	{ command: "model", description: "查看或热切换模型（list / <provider/id> / reset）" },
+	{ command: "mcp", description: "查看 MCP 服务状态或执行 /mcp reconnect" },
+	{ command: "routines", description: "查看、触发或删除定时提醒任务" },
+	{ command: "memory", description: "查看、检索、整理或导出长期记忆" },
+	{ command: "flush", description: "立即补发静默期暂存的通知汇总" },
+	{ command: "handoff", description: "整理记忆并无感开启新上下文窗口" },
+	{ command: "trace", description: "查看最近对话的调用链与耗时账单" },
+	{ command: "approve", description: "批准待确认的高风险外部写操作" },
+	{ command: "reject", description: "拒绝待确认的高风险外部写操作" },
+	{ command: "stop", description: "立即中止当前正在执行的任务" },
+];
+
+/** Minimal Telegram User object fields consumed by Jehee. */
+export type TelegramUser = {
+	readonly id: number | string;
+	readonly is_bot?: boolean;
+	readonly first_name?: string;
+	readonly last_name?: string;
+	readonly username?: string;
+};
+
+/** Minimal Telegram Chat object fields consumed by Jehee. */
+export type TelegramChat = {
+	readonly id: number | string;
+	readonly type: string;
+	readonly title?: string;
+	readonly username?: string;
+};
+
+/** Telegram Bot API 7.0+ `MessageOrigin` discriminated union for forwarded messages. */
+export type TelegramForwardOrigin =
+	| {
+			readonly type: "user";
+			readonly date: number;
+			readonly sender_user: TelegramUser;
+	  }
+	| {
+			readonly type: "hidden_user";
+			readonly date: number;
+			readonly sender_user_name: string;
+	  }
+	| {
+			readonly type: "chat";
+			readonly date: number;
+			readonly sender_chat: TelegramChat;
+			readonly author_signature?: string;
+	  }
+	| {
+			readonly type: "channel";
+			readonly date: number;
+			readonly chat: TelegramChat;
+			readonly message_id?: number;
+			readonly author_signature?: string;
+	  };
+
+/** Subset of a replied-to Telegram message (`message.reply_to_message`). */
+export type TelegramReplyMessage = {
+	readonly message_id: number | string;
+	readonly date?: number;
+	readonly from?: TelegramUser;
+	readonly text?: string;
+	readonly caption?: string;
+	readonly photo?: readonly TelegramPhotoSize[];
+	readonly document?: TelegramDocument;
+	readonly voice?: TelegramVoice;
+	readonly audio?: TelegramAudio;
+};
+
+/** Subset of Telegram's partial text quote (`message.quote`). */
+export type TelegramTextQuote = {
+	readonly text: string;
+};
 
 /** Telegram photo variant metadata (`PhotoSize`). */
 export type TelegramPhotoSize = {
@@ -65,33 +153,28 @@ export type TelegramUpdate = {
 	readonly message?: {
 		readonly message_id: number | string;
 		readonly date?: number;
-		readonly from?: {
-			readonly id: number | string;
-			readonly username?: string;
-		};
-		readonly chat: {
-			readonly id: number | string;
-			readonly type: string;
-		};
+		readonly from?: TelegramUser;
+		readonly chat: TelegramChat;
 		readonly text?: string;
 		readonly caption?: string;
 		readonly photo?: readonly TelegramPhotoSize[];
 		readonly document?: TelegramDocument;
 		readonly voice?: TelegramVoice;
 		readonly audio?: TelegramAudio;
+		readonly reply_to_message?: TelegramReplyMessage;
+		readonly quote?: TelegramTextQuote;
+		readonly forward_origin?: TelegramForwardOrigin;
+		readonly forward_from?: TelegramUser;
+		readonly forward_sender_name?: string;
+		readonly forward_from_chat?: TelegramChat;
+		readonly forward_date?: number;
 	};
 	readonly callback_query?: {
 		readonly id: string;
-		readonly from: {
-			readonly id: number | string;
-			readonly username?: string;
-		};
+		readonly from: TelegramUser;
 		readonly message?: {
 			readonly message_id: number | string;
-			readonly chat: {
-				readonly id: number | string;
-				readonly type: string;
-			};
+			readonly chat: TelegramChat;
 		};
 		readonly data?: string;
 	};
@@ -209,6 +292,173 @@ function inferFileNameForMime(prefix: string, mimeType: string): string {
 	const normalized = normalizeMimeType(mimeType);
 	const ext = MIME_TO_EXTENSION[normalized] ?? "bin";
 	return `${prefix}.${ext}`;
+}
+
+function isPdfDocument(mimeType: string, fileName: string | undefined): boolean {
+	const normalized = normalizeMimeType(mimeType);
+	if (normalized === "application/pdf") return true;
+	if (normalized.length === 0 || normalized === "application/octet-stream") {
+		return getFileExtension(fileName) === "pdf";
+	}
+	return false;
+}
+
+function formatTelegramUserLabel(user: TelegramUser | undefined): string | undefined {
+	if (user === undefined) return undefined;
+	const fullName = [user.first_name?.trim(), user.last_name?.trim()].filter((p) => p && p.length > 0).join(" ");
+	if (fullName.length > 0 && user.username !== undefined && user.username.trim().length > 0) {
+		return `${fullName} (@${user.username.trim()})`;
+	}
+	if (fullName.length > 0) return fullName;
+	if (user.username !== undefined && user.username.trim().length > 0) return `@${user.username.trim()}`;
+	return `user#${String(user.id)}`;
+}
+
+function formatTelegramChatLabel(chat: TelegramChat | undefined): string | undefined {
+	if (chat === undefined) return undefined;
+	if (chat.title !== undefined && chat.title.trim().length > 0) {
+		if (chat.username !== undefined && chat.username.trim().length > 0) {
+			return `${chat.title.trim()} (@${chat.username.trim()})`;
+		}
+		return chat.title.trim();
+	}
+	if (chat.username !== undefined && chat.username.trim().length > 0) return `@${chat.username.trim()}`;
+	return `chat#${String(chat.id)}`;
+}
+
+function summarizeReplyAttachments(reply: TelegramReplyMessage): string | undefined {
+	const parts: string[] = [];
+	if (reply.photo !== undefined && reply.photo.length > 0) parts.push("photo");
+	if (reply.document !== undefined) {
+		parts.push(reply.document.file_name !== undefined ? `document: ${reply.document.file_name}` : "document");
+	}
+	if (reply.voice !== undefined) parts.push(`voice (${reply.voice.duration}s)`);
+	if (reply.audio !== undefined) {
+		parts.push(reply.audio.file_name !== undefined ? `audio: ${reply.audio.file_name}` : "audio");
+	}
+	return parts.length > 0 ? parts.join(", ") : undefined;
+}
+
+function extractTelegramReplyContext(
+	reply: TelegramReplyMessage | undefined,
+	quote: TelegramTextQuote | undefined,
+): InboundReplyContext | undefined {
+	const quoteText = quote?.text?.trim();
+	if (reply === undefined && (quoteText === undefined || quoteText.length === 0)) {
+		return undefined;
+	}
+	const rawText = quoteText && quoteText.length > 0 ? quoteText : (reply?.text ?? reply?.caption)?.trim();
+	const boundedText =
+		rawText !== undefined && rawText.length > 0
+			? rawText.length > MAX_REPLY_EXCERPT_CHARS
+				? `${rawText.slice(0, MAX_REPLY_EXCERPT_CHARS)}...[truncated]`
+				: rawText
+			: undefined;
+	const senderName = formatTelegramUserLabel(reply?.from);
+	const attachmentSummary = reply !== undefined ? summarizeReplyAttachments(reply) : undefined;
+	if (boundedText === undefined && attachmentSummary === undefined && reply === undefined) {
+		return undefined;
+	}
+	return {
+		...(reply !== undefined ? { messageId: String(reply.message_id) } : {}),
+		...(senderName !== undefined ? { senderName } : {}),
+		...(reply?.from?.is_bot === true ? { isFromAssistant: true } : {}),
+		...(boundedText !== undefined ? { text: boundedText } : {}),
+		...(quoteText !== undefined && quoteText.length > 0 ? { isPartialQuote: true } : {}),
+		...(attachmentSummary !== undefined ? { attachmentSummary } : {}),
+	};
+}
+
+function extractTelegramForwardContext(msg: NonNullable<TelegramUpdate["message"]>): InboundForwardContext | undefined {
+	const origin = msg.forward_origin;
+	if (origin !== undefined) {
+		const originalTimestampMs = Number.isFinite(origin.date) ? origin.date * 1000 : undefined;
+		if (origin.type === "user") {
+			return {
+				originType: "user",
+				originLabel: formatTelegramUserLabel(origin.sender_user) ?? "unknown user",
+				...(originalTimestampMs !== undefined ? { originalTimestampMs } : {}),
+			};
+		}
+		if (origin.type === "hidden_user") {
+			return {
+				originType: "hidden_user",
+				originLabel: origin.sender_user_name.trim() || "hidden user",
+				...(originalTimestampMs !== undefined ? { originalTimestampMs } : {}),
+			};
+		}
+		if (origin.type === "chat") {
+			return {
+				originType: "chat",
+				originLabel: formatTelegramChatLabel(origin.sender_chat) ?? "unknown chat",
+				...(origin.author_signature?.trim() ? { authorSignature: origin.author_signature.trim() } : {}),
+				...(originalTimestampMs !== undefined ? { originalTimestampMs } : {}),
+			};
+		}
+		return {
+			originType: "channel",
+			originLabel: formatTelegramChatLabel(origin.chat) ?? "unknown channel",
+			...(origin.author_signature?.trim() ? { authorSignature: origin.author_signature.trim() } : {}),
+			...(originalTimestampMs !== undefined ? { originalTimestampMs } : {}),
+		};
+	}
+
+	const legacyTimestampMs = msg.forward_date !== undefined ? msg.forward_date * 1000 : undefined;
+	if (msg.forward_from !== undefined) {
+		return {
+			originType: "user",
+			originLabel: formatTelegramUserLabel(msg.forward_from) ?? "unknown user",
+			...(legacyTimestampMs !== undefined ? { originalTimestampMs: legacyTimestampMs } : {}),
+		};
+	}
+	if (msg.forward_sender_name !== undefined && msg.forward_sender_name.trim().length > 0) {
+		return {
+			originType: "hidden_user",
+			originLabel: msg.forward_sender_name.trim(),
+			...(legacyTimestampMs !== undefined ? { originalTimestampMs: legacyTimestampMs } : {}),
+		};
+	}
+	if (msg.forward_from_chat !== undefined) {
+		return {
+			originType: msg.forward_from_chat.type === "channel" ? "channel" : "chat",
+			originLabel: formatTelegramChatLabel(msg.forward_from_chat) ?? "unknown chat",
+			...(legacyTimestampMs !== undefined ? { originalTimestampMs: legacyTimestampMs } : {}),
+		};
+	}
+	return undefined;
+}
+
+/** Formats optional quoted-reply and forwarded-origin metadata into concise context prefix lines for the model. */
+export function formatInboundMessageContextPrefix(input: {
+	readonly replyContext?: InboundReplyContext;
+	readonly forwardContext?: InboundForwardContext;
+}): string | undefined {
+	const lines: string[] = [];
+	if (input.replyContext !== undefined) {
+		const rc = input.replyContext;
+		const who = rc.isFromAssistant
+			? rc.senderName
+				? `${rc.senderName} (assistant)`
+				: "assistant"
+			: (rc.senderName ?? "previous message");
+		const msgRef = rc.messageId !== undefined ? ` msg #${rc.messageId}` : "";
+		const kind = rc.isPartialQuote ? "Quoted excerpt" : "Replying to";
+		const details: string[] = [];
+		if (rc.attachmentSummary !== undefined) details.push(`[${rc.attachmentSummary}]`);
+		if (rc.text !== undefined) details.push(rc.text);
+		const body = details.length > 0 ? `: ${details.join(" ")}` : "";
+		lines.push(`[${kind} ${who}${msgRef}${body}]`);
+	}
+	if (input.forwardContext !== undefined) {
+		const fc = input.forwardContext;
+		const authorPart = fc.authorSignature !== undefined ? ` by ${fc.authorSignature}` : "";
+		const datePart =
+			fc.originalTimestampMs !== undefined
+				? ` on ${new Date(fc.originalTimestampMs).toISOString().slice(0, 16).replace("T", " ")}Z`
+				: "";
+		lines.push(`[Forwarded from ${fc.originType} "${fc.originLabel}"${authorPart}${datePart}]`);
+	}
+	return lines.length > 0 ? lines.join("\n") : undefined;
 }
 
 function isReadableDocument(mimeType: string, fileName: string | undefined): boolean {
@@ -438,6 +688,9 @@ export function parseTelegramUpdate(
 	const hasText = rawBody !== undefined && rawBody.trim().length > 0;
 	if (!hasText && attachments.length === 0) return undefined;
 
+	const replyContext = extractTelegramReplyContext(msg.reply_to_message, msg.quote);
+	const forwardContext = extractTelegramForwardContext(msg);
+
 	return {
 		channel: channelName,
 		chatId: String(msg.chat.id),
@@ -446,6 +699,8 @@ export function parseTelegramUpdate(
 		text: hasText ? rawBody : synthesizeAttachmentPlaceholder(attachments),
 		timestampMs: (msg.date ?? Math.floor(Date.now() / 1000)) * 1000,
 		...(attachments.length > 0 ? { attachments } : {}),
+		...(replyContext !== undefined ? { replyContext } : {}),
+		...(forwardContext !== undefined ? { forwardContext } : {}),
 	};
 }
 
@@ -569,6 +824,134 @@ export function formatInboundAttachmentsContext(
 	return { textNotes, images };
 }
 
+/**
+ * Async variant of `formatInboundAttachmentsContext` that also extracts readable text from `application/pdf`
+ * attachments via the portable Web-standard PDF text extractor (`extractPdfText`).
+ */
+export async function formatInboundAttachmentsContextAsync(
+	attachments: readonly ChannelAttachment[],
+	downloaded: ReadonlyMap<string, DownloadedChannelFile> | Readonly<Record<string, DownloadedChannelFile>>,
+	options?: { readonly maxTextChars?: number },
+): Promise<FormattedInboundAttachments> {
+	const maxTextChars = Math.max(200, options?.maxTextChars ?? DEFAULT_ATTACHMENT_TEXT_EXCERPT_CHARS);
+	const lookup = (fileId: string): DownloadedChannelFile | undefined =>
+		downloaded instanceof Map
+			? downloaded.get(fileId)
+			: Object.hasOwn(downloaded, fileId)
+				? (downloaded as Readonly<Record<string, DownloadedChannelFile>>)[fileId]
+				: undefined;
+
+	const images: ImageContent[] = [];
+	const textNotes: string[] = [];
+	const decoder = new TextDecoder("utf-8", { fatal: false });
+	let remainingTextChars = maxTextChars;
+
+	for (const att of attachments) {
+		const file = lookup(att.fileId);
+		const fallbackName = att.fileName ?? att.fileId;
+
+		if (att.kind === "voice" || att.kind === "audio") {
+			const effectiveMime = normalizeMimeType(att.mimeType ?? file?.mimeType) || "audio/ogg";
+			const durPart = att.durationSeconds !== undefined ? `, ${att.durationSeconds}s` : "";
+			const sizePart =
+				file !== undefined
+					? `, ${file.bytes.byteLength} bytes`
+					: att.sizeBytes !== undefined
+						? `, ${att.sizeBytes} bytes`
+						: "";
+			const label =
+				att.kind === "voice" ? "Voice message" : `Audio attachment (${att.fileName ?? file?.fileName ?? "audio"})`;
+			textNotes.push(
+				`[${label}: ${effectiveMime}${durPart}${sizePart} — automatic speech transcription is not configured; ask the user for text if needed.]`,
+			);
+			continue;
+		}
+
+		if (file === undefined) {
+			textNotes.push(`[Attachment unavailable (${att.kind}): ${fallbackName} could not be downloaded.]`);
+			continue;
+		}
+
+		const fileName = att.fileName ?? file.fileName;
+		const attMime = normalizeMimeType(att.mimeType);
+		const fileMime = normalizeMimeType(file.mimeType);
+		const effectiveMime =
+			fileMime.length > 0 && fileMime !== "application/octet-stream"
+				? fileMime
+				: attMime.length > 0 && attMime !== "application/octet-stream"
+					? attMime
+					: "application/octet-stream";
+
+		const isRasterImage =
+			RASTER_VISION_IMAGE_MIMES.has(effectiveMime) ||
+			(att.kind === "image" && effectiveMime === "application/octet-stream");
+		if (isRasterImage) {
+			const normalizedImageMime =
+				effectiveMime === "image/jpg" || effectiveMime === "application/octet-stream"
+					? "image/jpeg"
+					: effectiveMime;
+			images.push({
+				type: "image",
+				data: bytesToBase64(file.bytes),
+				mimeType: normalizedImageMime,
+			});
+			continue;
+		}
+
+		if (isPdfDocument(effectiveMime, fileName)) {
+			const displayName = fileName ?? att.fileId;
+			if (remainingTextChars <= 0) {
+				textNotes.push(
+					`[PDF excerpt omitted due to context budget: ${displayName} (application/pdf, ${file.bytes.byteLength} bytes)]`,
+				);
+				continue;
+			}
+			const extracted = await extractPdfText(file.bytes, { maxChars: remainingTextChars });
+			if (extracted.ok) {
+				remainingTextChars = Math.max(0, remainingTextChars - Math.min(extracted.totalChars, remainingTextChars));
+				textNotes.push(
+					`[PDF Document: ${displayName} (application/pdf, ${file.bytes.byteLength} bytes)]\n${extracted.text}`,
+				);
+			} else if (extracted.reason === "encrypted") {
+				textNotes.push(
+					`[PDF Document: ${displayName} (application/pdf, ${file.bytes.byteLength} bytes) — PDF is password-protected/encrypted and cannot be read.]`,
+				);
+			} else if (extracted.reason === "no_text_layer") {
+				textNotes.push(
+					`[PDF Document: ${displayName} (application/pdf, ${file.bytes.byteLength} bytes) — no extractable text layer found (likely a scanned image PDF); ask the user to send page screenshots as photos for visual reading.]`,
+				);
+			} else {
+				textNotes.push(
+					`[PDF Document: ${displayName} (application/pdf, ${file.bytes.byteLength} bytes) — ${extracted.message}]`,
+				);
+			}
+			continue;
+		}
+
+		if (isReadableDocument(effectiveMime, fileName)) {
+			const decoded = decoder.decode(file.bytes).replace(/\r\n/g, "\n").trim();
+			const displayName = fileName ?? att.fileId;
+			if (remainingTextChars <= 0) {
+				textNotes.push(
+					`[Document excerpt omitted due to context budget: ${displayName} (${effectiveMime}, ${file.bytes.byteLength} bytes)]`,
+				);
+				continue;
+			}
+			const truncated = decoded.length > remainingTextChars;
+			const excerpt = truncated ? `${decoded.slice(0, remainingTextChars)}\n...[truncated]` : decoded;
+			remainingTextChars = Math.max(0, remainingTextChars - Math.min(decoded.length, remainingTextChars));
+			textNotes.push(`[Document: ${displayName} (${effectiveMime}, ${file.bytes.byteLength} bytes)]\n${excerpt}`);
+			continue;
+		}
+
+		textNotes.push(
+			`[Binary attachment: ${fileName ?? att.fileId} (${effectiveMime}, ${file.bytes.byteLength} bytes) — binary content cannot be inspected directly as plain text.]`,
+		);
+	}
+
+	return { textNotes, images };
+}
+
 /** Pure fetch-based Telegram Bot API outbound and file-download transport. */
 export class TelegramTransport implements ChannelTransport {
 	readonly channel: string;
@@ -620,6 +1003,24 @@ export class TelegramTransport implements ChannelTransport {
 				const detail = await response.text();
 				throw new Error(`Telegram sendMessage failed (${response.status}): ${detail}`);
 			}
+		}
+	}
+
+	/** Registers Jehee's slash command menu in Telegram (`setMyCommands`) so typing `/` displays autocomplete hints. */
+	async setMyCommands(commands: readonly TelegramBotCommand[] = JEHEE_TELEGRAM_COMMANDS): Promise<void> {
+		const response = await this.#fetch(`${this.#baseUrl}/setMyCommands`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				commands: commands.map((entry) => ({
+					command: entry.command.replace(/^\/+/, "").toLowerCase(),
+					description: entry.description.slice(0, 256),
+				})),
+			}),
+		});
+		if (!response.ok) {
+			const detail = await response.text();
+			throw new Error(`Telegram setMyCommands failed (${response.status}): ${detail}`);
 		}
 	}
 

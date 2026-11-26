@@ -8,6 +8,9 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import {
 	formatInboundAttachmentsContext,
+	formatInboundAttachmentsContextAsync,
+	formatInboundMessageContextPrefix,
+	JEHEE_TELEGRAM_COMMANDS,
 	parseTelegramUpdate,
 	pollTelegramUpdatesOnce,
 	splitTelegramText,
@@ -312,7 +315,9 @@ describe("telegram channel helpers", () => {
 			mimeType: "text/plain",
 			fileName: "note.txt",
 		});
-		assert.equal(calls.length, 7);
+		await transport.setMyCommands();
+		assert.equal(calls.length, 8);
+		assert.ok(calls.at(-1)?.endsWith("/setMyCommands"));
 	});
 
 	it("parses photo, document, voice, and audio updates both with and without captions", () => {
@@ -731,5 +736,187 @@ describe("telegram channel helpers", () => {
 			await host.close(BACKGROUND_CONTEXT);
 			await gateway.drain();
 		}
+	});
+
+	it("preserves reply_to_message, partial quote, and all forward_origin variants without breaking slash commands", async () => {
+		const quotedUpdate = parseTelegramUpdate({
+			update_id: 1001,
+			message: {
+				message_id: 88,
+				date: 1700001000,
+				from: { id: "owner-1", first_name: "Alice" },
+				chat: { id: "chat-1", type: "private" },
+				text: "请改到明天下午 3 点",
+				reply_to_message: {
+					message_id: 80,
+					from: { id: 999, is_bot: true, first_name: "Jehee" },
+					text: "已为你安排明天上午 10 点产品评审会议。",
+				},
+				quote: { text: "明天上午 10 点产品评审" },
+			},
+		});
+		assert.ok(quotedUpdate?.replyContext !== undefined);
+		assert.equal(quotedUpdate.replyContext.isPartialQuote, true);
+		assert.equal(quotedUpdate.replyContext.isFromAssistant, true);
+		assert.equal(quotedUpdate.replyContext.text, "明天上午 10 点产品评审");
+		const quotedPrefix = formatInboundMessageContextPrefix(quotedUpdate);
+		assert.ok(quotedPrefix?.includes("Quoted excerpt Jehee (assistant) msg #80: 明天上午 10 点产品评审"));
+
+		const channelForward = parseTelegramUpdate({
+			update_id: 1002,
+			message: {
+				message_id: 89,
+				date: 1700001010,
+				from: { id: "owner-1" },
+				chat: { id: "chat-1", type: "private" },
+				text: "Cloudflare Workers announces 10GB DO SQLite",
+				forward_origin: {
+					type: "channel",
+					date: 1700000000,
+					chat: { id: -100123, type: "channel", title: "Edge News", username: "edgenews" },
+					author_signature: "Editorial",
+				},
+			},
+		});
+		assert.equal(channelForward?.forwardContext?.originType, "channel");
+		assert.equal(channelForward?.forwardContext?.originLabel, "Edge News (@edgenews)");
+		assert.equal(channelForward?.forwardContext?.authorSignature, "Editorial");
+		const fwdPrefix = formatInboundMessageContextPrefix(channelForward!);
+		assert.ok(fwdPrefix?.includes('[Forwarded from channel "Edge News (@edgenews)" by Editorial'));
+
+		const legacyForward = parseTelegramUpdate({
+			update_id: 1003,
+			message: {
+				message_id: 90,
+				date: 1700001020,
+				from: { id: "owner-1" },
+				chat: { id: "chat-1", type: "private" },
+				text: "机票确认单",
+				forward_sender_name: "Hidden Bob",
+				forward_date: 1700000500,
+			},
+		});
+		assert.equal(legacyForward?.forwardContext?.originType, "hidden_user");
+		assert.equal(legacyForward?.forwardContext?.originLabel, "Hidden Bob");
+
+		// End-to-end gateway check: slash command replying to a message still runs command; forwarded/replied messages inject prefix.
+		const seenInputs: string[] = [];
+		const faux = fauxProvider();
+		faux.setResponses([
+			(ctx) => {
+				const lastUser = ctx.messages.findLast((m) => m.role === "user");
+				if (lastUser?.role === "user" && typeof lastUser.content === "string") {
+					seenInputs.push(lastUser.content);
+				}
+				return fauxAssistantMessage("noted forwarded + pdf");
+			},
+		]);
+		const models = createModels();
+		models.setProvider(faux.provider);
+		const host = await JeheeHost.open(
+			{
+				storage: { kind: "memory" },
+				models,
+				defaultModel: { provider: "faux", modelId: faux.getModel().id },
+			},
+			BACKGROUND_CONTEXT,
+		);
+		const sent: string[] = [];
+		const samplePdfBytes = new TextEncoder().encode(
+			"%PDF-1.4\n1 0 obj << /Length 42 >>\nstream\nBT /F1 12 Tf (Flight CA1234 Gate B7) Tj ET\nendstream\nendobj\n%%EOF",
+		);
+		const gateway = new ChannelGateway({
+			host,
+			allowFrom: { telegram: ["owner-1"] },
+		});
+		gateway.registerTransport({
+			channel: "telegram",
+			sendText: async (_chatId, text) => {
+				sent.push(text);
+			},
+			downloadFile: async () => ({
+				bytes: samplePdfBytes,
+				mimeType: "application/pdf",
+				fileName: "boarding.pdf",
+			}),
+		});
+
+		try {
+			// 1. Replying to a previous message with `/status` still executes `/status` deterministically.
+			const slashReply = parseTelegramUpdate({
+				update_id: 1004,
+				message: {
+					message_id: 91,
+					from: { id: "owner-1" },
+					chat: { id: "chat-1", type: "private" },
+					text: "/status",
+					reply_to_message: { message_id: 80, text: "older message" },
+				},
+			})!;
+			const cmdRes = await gateway.ingest(slashReply, BACKGROUND_CONTEXT);
+			assert.deepEqual(cmdRes, { kind: "command_handled", command: "status" });
+
+			// 2. Forwarded PDF document preserves origin AND extracts readable PDF text automatically.
+			const fwdPdf = parseTelegramUpdate({
+				update_id: 1005,
+				message: {
+					message_id: 92,
+					from: { id: "owner-1" },
+					chat: { id: "chat-1", type: "private" },
+					caption: "帮我记一下登机口",
+					document: { file_id: "pdf-1", file_name: "boarding.pdf", mime_type: "application/pdf" },
+					forward_origin: {
+						type: "user",
+						date: 1700000100,
+						sender_user: { id: 777, first_name: "Travel", last_name: "Agent" },
+					},
+				},
+			})!;
+			const turnRes = await gateway.ingest(fwdPdf, BACKGROUND_CONTEXT);
+			assert.deepEqual(turnRes, { kind: "replied", replyText: "noted forwarded + pdf" });
+			assert.equal(seenInputs.length, 1);
+			assert.ok(seenInputs[0]!.includes('[Forwarded from user "Travel Agent"'));
+			assert.ok(seenInputs[0]!.includes("帮我记一下登机口"));
+			assert.ok(seenInputs[0]!.includes("[PDF Document: boarding.pdf"));
+			assert.ok(seenInputs[0]!.includes("Flight CA1234 Gate B7"));
+		} finally {
+			gateway.dispose();
+			await host.close(BACKGROUND_CONTEXT);
+			await gateway.drain();
+		}
+
+		// Verify setMyCommands payload shape and JEHEE_TELEGRAM_COMMANDS validity.
+		let sentCommandsPayload: unknown;
+		const cmdTransport = new TelegramTransport({
+			botToken: "tok",
+			fetchImpl: async (input, init) => {
+				assert.ok(String(input).endsWith("/setMyCommands"));
+				sentCommandsPayload = JSON.parse(String(init?.body));
+				return Response.json({ ok: true, result: true });
+			},
+		});
+		await cmdTransport.setMyCommands();
+		const body = sentCommandsPayload as { commands: Array<{ command: string; description: string }> };
+		assert.equal(body.commands.length, JEHEE_TELEGRAM_COMMANDS.length);
+		assert.ok(body.commands.some((c) => c.command === "status"));
+		assert.ok(body.commands.some((c) => c.command === "mcp"));
+		assert.ok(body.commands.some((c) => c.command === "model"));
+		for (const item of body.commands) {
+			assert.match(item.command, /^[a-z0-9_]{1,32}$/);
+			assert.ok(item.description.length >= 3 && item.description.length <= 256);
+		}
+
+		// Verify async PDF formatter directly for scanned/encrypted PDFs too.
+		const scannedFmt = await formatInboundAttachmentsContextAsync(
+			[{ kind: "document", fileId: "scan-1", fileName: "scan.pdf", mimeType: "application/pdf" }],
+			{
+				"scan-1": {
+					bytes: new TextEncoder().encode("%PDF-1.5\n1 0 obj << /Subtype /Image >> endobj\n%%EOF"),
+					mimeType: "application/pdf",
+					fileName: "scan.pdf",
+				},
+			},
+		);
+		assert.match(scannedFmt.textNotes[0]!, /no extractable text layer/);
 	});
 });

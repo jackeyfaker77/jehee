@@ -196,7 +196,9 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 				...(config.quietPolicy !== undefined ? { quietPolicy: config.quietPolicy } : {}),
 			});
 			if (config.telegram !== undefined) {
-				this.#gateway.registerTransport(new TelegramTransport({ botToken: config.telegram.botToken }));
+				const telegramTransport = new TelegramTransport({ botToken: config.telegram.botToken });
+				this.#gateway.registerTransport(telegramTransport);
+				ctx.waitUntil(telegramTransport.setMyCommands().catch(() => undefined));
 			}
 
 			await this.#armAlarm(this.#host.wake());
