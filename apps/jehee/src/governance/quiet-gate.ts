@@ -37,12 +37,27 @@ export type HeldProactiveMessage = {
 	readonly heldAtMs: number;
 };
 
+/** Decision returned by `ProactiveNotificationGovernor.classify` (pure, without mutating in-memory held queue). */
+export type ProactiveClassification =
+	| { readonly action: "drop_silent" }
+	| { readonly action: "deliver" }
+	| { readonly action: "hold"; readonly reason: ProactiveHoldReason };
+
 /** Decision returned by `ProactiveNotificationGovernor.evaluate`. */
 export type ProactiveGateDecision =
 	| { readonly action: "drop_silent" }
 	| { readonly action: "deliver" }
 	| { readonly action: "hold"; readonly reason: ProactiveHoldReason; readonly heldCount: number };
 
+/** Grouped outbound digest batch formatted from one or more deferred proactive notifications for a single route. */
+export type HeldNotificationBatch = {
+	readonly route: ChannelRoute;
+	readonly digestText: string;
+	readonly count: number;
+};
+
+const MINUTE_MS = 60_000;
+const DAY_MS = 86_400_000;
 const HH_MM_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const WINDOW_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$/;
 const OFFSET_PATTERN = /^([+-])([01]\d|2[0-3])(?::?([0-5]\d))?$/;
@@ -97,13 +112,64 @@ export function formatMinuteOfDay(minute: number): string {
 
 /** True when `timestampMs` falls inside `window` in the window's configured local UTC offset. */
 export function isWithinQuietHours(timestampMs: number, window: QuietHoursWindow): boolean {
-	const totalMinutesUtc = Math.floor(timestampMs / 60_000);
+	const totalMinutesUtc = Math.floor(timestampMs / MINUTE_MS);
 	const localMinute = (((totalMinutesUtc + window.utcOffsetMinutes) % 1440) + 1440) % 1440;
 	if (window.startMinute < window.endMinute) {
 		return localMinute >= window.startMinute && localMinute < window.endMinute;
 	}
 	// Overnight wrap (e.g. 23:00 -> 08:00).
 	return localMinute >= window.startMinute || localMinute < window.endMinute;
+}
+
+/**
+ * Computes the exact epoch millisecond timestamp when `window` next ends (`> nowMs`) using pure UTC-offset arithmetic
+ * (zero host OS timezone dependency). When `isWithinQuietHours(nowMs, window)` is true, this is the exact end of the
+ * active quiet window; otherwise it is the end of the next upcoming quiet window.
+ */
+export function computeNextQuietEndMs(window: QuietHoursWindow, nowMs: number): number {
+	const offsetMs = window.utcOffsetMinutes * MINUTE_MS;
+	const localNowMs = nowMs + offsetMs;
+	const local = new Date(localNowMs);
+	const endHour = Math.floor(window.endMinute / 60);
+	const endMinute = window.endMinute % 60;
+	let candidateLocalMs = Date.UTC(
+		local.getUTCFullYear(),
+		local.getUTCMonth(),
+		local.getUTCDate(),
+		endHour,
+		endMinute,
+		0,
+		0,
+	);
+	if (candidateLocalMs <= localNowMs) {
+		candidateLocalMs += DAY_MS;
+	}
+	return candidateLocalMs - offsetMs;
+}
+
+/** Groups deferred proactive notifications by route key and formats each route's digest message. */
+export function formatHeldNotificationBatches(items: readonly HeldProactiveMessage[]): HeldNotificationBatch[] {
+	if (items.length === 0) return [];
+	const grouped = new Map<string, { route: ChannelRoute; texts: string[] }>();
+	for (const item of items) {
+		const key = formatRouteKey(item.route.channel, item.route.chatId);
+		let bucket = grouped.get(key);
+		if (bucket === undefined) {
+			bucket = { route: { channel: item.route.channel, chatId: item.route.chatId }, texts: [] };
+			grouped.set(key, bucket);
+		}
+		bucket.texts.push(item.text);
+	}
+
+	const out: HeldNotificationBatch[] = [];
+	for (const { route, texts } of grouped.values()) {
+		const digestText =
+			texts.length === 1
+				? `[暂存通知补发]\n${texts[0]!}`
+				: `[暂存通知汇总（共 ${texts.length} 条）]\n${texts.map((t, i) => `${i + 1}. ${t}`).join("\n\n")}`;
+		out.push({ route, digestText, count: texts.length });
+	}
+	return out;
 }
 
 /** True when a background turn's text is empty or equals the `[SILENT]` no-op sentinel. */
@@ -122,6 +188,11 @@ export class ProactiveNotificationGovernor {
 		this.#policy = policy ?? {};
 	}
 
+	/** Configured quiet-hours window, if any. */
+	get quietHours(): QuietHoursWindow | undefined {
+		return this.#policy.quietHours;
+	}
+
 	/** Current count of deferred proactive notifications held across all routes. */
 	get heldCount(): number {
 		return this.#held.length;
@@ -132,6 +203,39 @@ export class ProactiveNotificationGovernor {
 		return [...this.#held];
 	}
 
+	/**
+	 * Evaluates the policy action (`drop_silent` / `deliver` / `hold`) without mutating the in-memory held buffer,
+	 * enabling durable callers backed by `HeldNotificationsDoc` to persist held items directly.
+	 */
+	classify(params: {
+		readonly route: ChannelRoute;
+		readonly text: string;
+		readonly urgency?: "normal" | "urgent";
+		readonly isBusy: boolean;
+		readonly nowMs: number;
+	}): ProactiveClassification {
+		if (isSilentReplyText(params.text)) {
+			return { action: "drop_silent" };
+		}
+		if (params.urgency === "urgent") {
+			return { action: "deliver" };
+		}
+		if (this.#policy.quietHours !== undefined && isWithinQuietHours(params.nowMs, this.#policy.quietHours)) {
+			return { action: "hold", reason: "quiet_hours" };
+		}
+		const yieldWhenBusy = this.#policy.yieldWhenBusy ?? true;
+		if (yieldWhenBusy && params.isBusy) {
+			return { action: "hold", reason: "busy_yield" };
+		}
+		const minInterval = this.#policy.minIntervalMs ?? 0;
+		const routeKey = formatRouteKey(params.route.channel, params.route.chatId);
+		const lastSent = this.#lastSentAtByRoute.get(routeKey);
+		if (minInterval > 0 && lastSent !== undefined && params.nowMs - lastSent < minInterval) {
+			return { action: "hold", reason: "rate_cooldown" };
+		}
+		return { action: "deliver" };
+	}
+
 	/** Evaluates whether a proactive notification should be dropped (`[SILENT]`), held, or delivered now. */
 	evaluate(params: {
 		readonly route: ChannelRoute;
@@ -140,44 +244,17 @@ export class ProactiveNotificationGovernor {
 		readonly isBusy: boolean;
 		readonly nowMs: number;
 	}): ProactiveGateDecision {
-		if (isSilentReplyText(params.text)) {
-			return { action: "drop_silent" };
+		const decision = this.classify(params);
+		if (decision.action !== "hold") {
+			return decision;
 		}
-		if (params.urgency === "urgent") {
-			return { action: "deliver" };
-		}
-		if (this.#policy.quietHours !== undefined && isWithinQuietHours(params.nowMs, this.#policy.quietHours)) {
-			this.#held.push({
-				route: params.route,
-				text: params.text.trim(),
-				reason: "quiet_hours",
-				heldAtMs: params.nowMs,
-			});
-			return { action: "hold", reason: "quiet_hours", heldCount: this.#held.length };
-		}
-		const yieldWhenBusy = this.#policy.yieldWhenBusy ?? true;
-		if (yieldWhenBusy && params.isBusy) {
-			this.#held.push({
-				route: params.route,
-				text: params.text.trim(),
-				reason: "busy_yield",
-				heldAtMs: params.nowMs,
-			});
-			return { action: "hold", reason: "busy_yield", heldCount: this.#held.length };
-		}
-		const minInterval = this.#policy.minIntervalMs ?? 0;
-		const routeKey = formatRouteKey(params.route.channel, params.route.chatId);
-		const lastSent = this.#lastSentAtByRoute.get(routeKey);
-		if (minInterval > 0 && lastSent !== undefined && params.nowMs - lastSent < minInterval) {
-			this.#held.push({
-				route: params.route,
-				text: params.text.trim(),
-				reason: "rate_cooldown",
-				heldAtMs: params.nowMs,
-			});
-			return { action: "hold", reason: "rate_cooldown", heldCount: this.#held.length };
-		}
-		return { action: "deliver" };
+		this.#held.push({
+			route: { channel: params.route.channel, chatId: params.route.chatId },
+			text: params.text.trim(),
+			reason: decision.reason,
+			heldAtMs: params.nowMs,
+		});
+		return { action: "hold", reason: decision.reason, heldCount: this.#held.length };
 	}
 
 	/** Records that a proactive notification was actually transmitted to `route` at `nowMs`. */
@@ -191,12 +268,14 @@ export class ProactiveNotificationGovernor {
 		return !isWithinQuietHours(nowMs, this.#policy.quietHours);
 	}
 
+	/** Computes the next quiet-hours window end timestamp (`> nowMs`), or `undefined` if no quiet window is configured. */
+	nextQuietEndMs(nowMs: number): number | undefined {
+		if (this.#policy.quietHours === undefined) return undefined;
+		return computeNextQuietEndMs(this.#policy.quietHours, nowMs);
+	}
+
 	/** Drains held notifications (optionally filtered to one `route`) grouped by route key. */
-	drainHeld(targetRoute?: ChannelRoute): ReadonlyArray<{
-		readonly route: ChannelRoute;
-		readonly digestText: string;
-		readonly count: number;
-	}> {
+	drainHeld(targetRoute?: ChannelRoute): readonly HeldNotificationBatch[] {
 		if (this.#held.length === 0) return [];
 		const targetKey = targetRoute !== undefined ? formatRouteKey(targetRoute.channel, targetRoute.chatId) : undefined;
 		const matched: HeldProactiveMessage[] = [];
@@ -213,25 +292,6 @@ export class ProactiveNotificationGovernor {
 		this.#held.length = 0;
 		this.#held.push(...remaining);
 
-		const grouped = new Map<string, { route: ChannelRoute; texts: string[] }>();
-		for (const item of matched) {
-			const key = formatRouteKey(item.route.channel, item.route.chatId);
-			let bucket = grouped.get(key);
-			if (bucket === undefined) {
-				bucket = { route: item.route, texts: [] };
-				grouped.set(key, bucket);
-			}
-			bucket.texts.push(item.text);
-		}
-
-		const out: Array<{ route: ChannelRoute; digestText: string; count: number }> = [];
-		for (const { route, texts } of grouped.values()) {
-			const digestText =
-				texts.length === 1
-					? `[暂存通知补发]\n${texts[0]!}`
-					: `[暂存通知汇总（共 ${texts.length} 条）]\n${texts.map((t, i) => `${i + 1}. ${t}`).join("\n\n")}`;
-			out.push({ route, digestText, count: texts.length });
-		}
-		return out;
+		return formatHeldNotificationBatches(matched);
 	}
 }

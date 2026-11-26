@@ -80,12 +80,18 @@ type DispatchItem = {
 };
 
 type RoutineSchedulerState =
-	| { readonly phase: "wait"; readonly seq: number }
+	| { readonly phase: "wait"; readonly seq: number; readonly quietFlushBackoffUntilMs?: number }
+	| {
+			readonly phase: "flushQuiet";
+			readonly seq: number;
+			readonly dueAtMs: number;
+	  }
 	| {
 			readonly phase: "dispatch";
 			readonly seq: number;
 			readonly items: readonly DispatchItem[];
 			readonly index: number;
+			readonly quietFlushBackoffUntilMs?: number;
 	  };
 
 /** Lightweight in-memory tracker monitoring active routine dispatch cycles (for DO `alarm()` `waitUntil` & test helpers). */
@@ -283,6 +289,25 @@ export async function dispatchRoutineExecution(
 	);
 }
 
+/** Default backoff (ms) before retrying a failed quiet-hours auto-flush so transient delivery errors never spin-loop. */
+export const DEFAULT_QUIET_FLUSH_RETRY_BACKOFF_MS = 60_000;
+
+type QuietFlushHooks = {
+	readonly getNextQuietFlushAtMs?: (nowMs: number, tx?: Tx) => Promise<number | undefined>;
+	readonly onQuietFlushDue?: (nowMs: number, context: Context) => Promise<void>;
+	readonly quietFlushRetryBackoffMs?: number;
+};
+
+// WeakMap keyed by the task token allows callers to supply quiet-flush callbacks either on
+// `createRoutineSchedulerTask(...)` or on `createRoutinesExtension(...)` without leaking memory.
+const quietFlushBindings = new WeakMap<object, QuietFlushHooks>();
+
+function minDefined(a: number | undefined, b: number | undefined): number | undefined {
+	if (a === undefined) return b;
+	if (b === undefined) return a;
+	return Math.min(a, b);
+}
+
 /** Options for creating the single-flight background `RoutineSchedulerTask`. */
 export type CreateRoutineSchedulerTaskOptions = {
 	readonly getUtcOffsetMinutes: () => number;
@@ -294,21 +319,128 @@ export type CreateRoutineSchedulerTaskOptions = {
 		answerEntryId: EntryId,
 		urgency: RoutineUrgency,
 	) => void | Promise<void>;
+	/**
+	 * Optional callback returning the next epoch ms when held quiet-hours notifications should auto-flush.
+	 * Invoked inside `runtime.commit(tx)` so callers can read `tx.doc(HeldNotificationsDoc)` atomically with sleep/terminal transitions.
+	 */
+	readonly getNextQuietFlushAtMs?: (nowMs: number, tx?: Tx) => Promise<number | undefined>;
+	/** Optional callback invoked when `getNextQuietFlushAtMs(nowMs, tx) <= nowMs` to flush held quiet-hours notifications. */
+	readonly onQuietFlushDue?: (nowMs: number, context: Context) => Promise<void>;
+	/** Optional retry backoff (ms) when `onQuietFlushDue` or `getNextQuietFlushAtMs` fails transiently. Defaults to 60_000 ms. */
+	readonly quietFlushRetryBackoffMs?: number;
 };
 
-/** Creates the single-flight background `pi-durable` task sleeping until the earliest `nextRunAtMs` and dispatching due routines. */
+/** Creates the single-flight background `pi-durable` task sleeping until the earliest routine or quiet-hours flush timestamp. */
 export function createRoutineSchedulerTask(options: CreateRoutineSchedulerTaskOptions) {
-	return defineTask<{ readonly triggerAtMs: number }, RoutineSchedulerState, null>({
+	const resolveQuietHooks = (): {
+		readonly getNextQuietFlushAtMs?: (nowMs: number, tx?: Tx) => Promise<number | undefined>;
+		readonly onQuietFlushDue?: (nowMs: number, context: Context) => Promise<void>;
+		readonly retryBackoffMs: number;
+	} => {
+		const bound = quietFlushBindings.get(taskToken);
+		const getNextQuietFlushAtMs = bound?.getNextQuietFlushAtMs ?? options.getNextQuietFlushAtMs;
+		const onQuietFlushDue = bound?.onQuietFlushDue ?? options.onQuietFlushDue;
+		const retryBackoffMs = Math.max(
+			50,
+			bound?.quietFlushRetryBackoffMs ?? options.quietFlushRetryBackoffMs ?? DEFAULT_QUIET_FLUSH_RETRY_BACKOFF_MS,
+		);
+		return {
+			...(getNextQuietFlushAtMs !== undefined ? { getNextQuietFlushAtMs } : {}),
+			...(onQuietFlushDue !== undefined ? { onQuietFlushDue } : {}),
+			retryBackoffMs,
+		};
+	};
+
+	const taskToken = defineTask<{ readonly triggerAtMs: number }, RoutineSchedulerState, null>({
 		name: "jehee.routines.scheduler",
 		version: 1,
 		initial: () => ({ phase: "wait", seq: 0 }),
 		phases: {
 			wait: async (task, runtime, context) => {
 				const myTaskNum = Number(runtime.taskId);
+				const { getNextQuietFlushAtMs, onQuietFlushDue, retryBackoffMs } = resolveQuietHooks();
+
 				await runtime.commit(async (tx) => {
 					const doc = await tx.doc(RoutineDoc);
-					const earliest = findEarliestNextRunAtMs(doc);
-					if (earliest === undefined) {
+					const nowMs = runtime.now();
+					const nextSeq = task.state.checkpoint.seq + 1;
+					let backoffUntil = task.state.checkpoint.quietFlushBackoffUntilMs;
+					let effectiveQuietFlushAt: number | undefined;
+
+					// Only treat quiet-hours auto-flush as actionable when both lookup and flush callbacks are configured.
+					if (getNextQuietFlushAtMs !== undefined && onQuietFlushDue !== undefined) {
+						try {
+							const rawQuietAt = await getNextQuietFlushAtMs(nowMs, tx);
+							if (rawQuietAt === undefined) {
+								backoffUntil = undefined;
+								effectiveQuietFlushAt = undefined;
+							} else if (rawQuietAt > nowMs) {
+								backoffUntil = undefined;
+								effectiveQuietFlushAt = rawQuietAt;
+							} else if (backoffUntil !== undefined && nowMs < backoffUntil) {
+								// Respect active retry backoff across routine dispatches and alarm wakes.
+								effectiveQuietFlushAt = backoffUntil;
+							} else {
+								backoffUntil = undefined;
+								effectiveQuietFlushAt = rawQuietAt;
+							}
+						} catch (error) {
+							// Isolate transient lookup errors so the single-flight scheduler never faults.
+							if (runtime.signal.aborted || context.abortSignal?.aborted) {
+								throw error;
+							}
+							backoffUntil = nowMs + retryBackoffMs;
+							effectiveQuietFlushAt = backoffUntil;
+						}
+					} else {
+						backoffUntil = undefined;
+					}
+
+					// When quiet flush is immediately due, transition to `flushQuiet` so outbound I/O runs outside `tx`.
+					if (effectiveQuietFlushAt !== undefined && effectiveQuietFlushAt <= nowMs) {
+						doc.scheduledTaskId = myTaskNum;
+						delete doc.wakeSignalKey;
+						return {
+							status: "running",
+							checkpoint: { phase: "flushQuiet", seq: nextSeq, dueAtMs: nowMs },
+						} as const;
+					}
+
+					const earliestRoutineAt = findEarliestNextRunAtMs(doc);
+					if (earliestRoutineAt !== undefined && earliestRoutineAt <= nowMs) {
+						const claimed = claimDueRoutinesInState(doc, nowMs);
+						doc.scheduledTaskId = myTaskNum;
+						delete doc.wakeSignalKey;
+						if (claimed.length > 0) {
+							const batch: DispatchItem[] = claimed.map(({ item, fireAtMs }) => ({
+								id: item.id,
+								title: item.title,
+								mode: item.mode,
+								payload: item.payload,
+								urgency: item.urgency,
+								fireAtMs,
+							}));
+							const nextAfterClaim = minDefined(findEarliestNextRunAtMs(doc), effectiveQuietFlushAt);
+							if (nextAfterClaim !== undefined) {
+								doc.scheduledForMs = nextAfterClaim;
+							} else {
+								delete doc.scheduledForMs;
+							}
+							return {
+								status: "running",
+								checkpoint: {
+									phase: "dispatch",
+									seq: nextSeq,
+									items: batch,
+									index: 0,
+									...(backoffUntil !== undefined ? { quietFlushBackoffUntilMs: backoffUntil } : {}),
+								},
+							} as const;
+						}
+					}
+
+					const nextWakeAt = minDefined(findEarliestNextRunAtMs(doc), effectiveQuietFlushAt);
+					if (nextWakeAt === undefined) {
 						if (doc.scheduledTaskId === myTaskNum) {
 							delete doc.scheduledTaskId;
 							delete doc.scheduledForMs;
@@ -317,68 +449,85 @@ export function createRoutineSchedulerTask(options: CreateRoutineSchedulerTaskOp
 						return { status: "terminal", outcome: { status: "completed", result: null } } as const;
 					}
 
-					const nowMs = runtime.now();
-					const nextSeq = task.state.checkpoint.seq + 1;
-					if (nowMs < earliest) {
-						const signalKey = `rtn-wake-${myTaskNum}-${nextSeq}`;
-						doc.scheduledTaskId = myTaskNum;
-						doc.scheduledForMs = earliest;
-						doc.wakeSignalKey = signalKey;
-						return {
-							status: "sleeping",
-							until: earliest,
-							signals: [RoutineWakeSignal.key(signalKey)],
-							checkpoint: { phase: "wait", seq: nextSeq },
-						} as const;
-					}
-
-					const claimed = claimDueRoutinesInState(doc, nowMs);
+					const signalKey = `rtn-wake-${myTaskNum}-${nextSeq}`;
 					doc.scheduledTaskId = myTaskNum;
-					delete doc.wakeSignalKey;
-					if (claimed.length === 0) {
-						const nextEarliest = findEarliestNextRunAtMs(doc);
-						if (nextEarliest === undefined) {
-							delete doc.scheduledTaskId;
-							delete doc.scheduledForMs;
-							return { status: "terminal", outcome: { status: "completed", result: null } } as const;
-						}
-						const signalKey = `rtn-wake-${myTaskNum}-${nextSeq}`;
-						doc.scheduledForMs = nextEarliest;
-						doc.wakeSignalKey = signalKey;
-						return {
-							status: "sleeping",
-							until: nextEarliest,
-							signals: [RoutineWakeSignal.key(signalKey)],
-							checkpoint: { phase: "wait", seq: nextSeq },
-						} as const;
-					}
+					doc.scheduledForMs = nextWakeAt;
+					doc.wakeSignalKey = signalKey;
+					return {
+						status: "sleeping",
+						until: nextWakeAt,
+						signals: [RoutineWakeSignal.key(signalKey)],
+						checkpoint: {
+							phase: "wait",
+							seq: nextSeq,
+							...(backoffUntil !== undefined ? { quietFlushBackoffUntilMs: backoffUntil } : {}),
+						},
+					} as const;
+				}, context);
+			},
+			flushQuiet: async (task, runtime, context) => {
+				const { seq, dueAtMs } = task.state.checkpoint;
+				const { getNextQuietFlushAtMs, onQuietFlushDue, retryBackoffMs } = resolveQuietHooks();
+				let flushFailed = false;
 
-					const batch: DispatchItem[] = claimed.map(({ item, fireAtMs }) => ({
-						id: item.id,
-						title: item.title,
-						mode: item.mode,
-						payload: item.payload,
-						urgency: item.urgency,
-						fireAtMs,
-					}));
-					const nextAfterClaim = findEarliestNextRunAtMs(doc);
-					if (nextAfterClaim !== undefined) {
-						doc.scheduledForMs = nextAfterClaim;
-					} else {
-						delete doc.scheduledForMs;
+				if (onQuietFlushDue !== undefined) {
+					const endDispatch = options.tracker.beginDispatch();
+					try {
+						await onQuietFlushDue(dueAtMs, context);
+					} catch (error) {
+						// Isolate transient delivery errors so the single-flight scheduler never faults.
+						if (runtime.signal.aborted || context.abortSignal?.aborted) {
+							throw error;
+						}
+						flushFailed = true;
+					} finally {
+						endDispatch();
+					}
+				}
+
+				await runtime.commit(async (tx) => {
+					const postNowMs = runtime.now();
+					let backoffUntil: number | undefined;
+					if (flushFailed) {
+						backoffUntil = postNowMs + retryBackoffMs;
+					} else if (getNextQuietFlushAtMs !== undefined && onQuietFlushDue !== undefined) {
+						try {
+							const postQuietAt = await getNextQuietFlushAtMs(postNowMs, tx);
+							// If items remain immediately due even after an attempted flush, apply backoff to prevent busy-spin.
+							if (postQuietAt !== undefined && postQuietAt <= postNowMs) {
+								backoffUntil = postNowMs + retryBackoffMs;
+							}
+						} catch (error) {
+							if (runtime.signal.aborted || context.abortSignal?.aborted) {
+								throw error;
+							}
+							backoffUntil = postNowMs + retryBackoffMs;
+						}
 					}
 					return {
 						status: "running",
-						checkpoint: { phase: "dispatch", seq: nextSeq, items: batch, index: 0 },
+						checkpoint: {
+							phase: "wait",
+							seq,
+							...(backoffUntil !== undefined ? { quietFlushBackoffUntilMs: backoffUntil } : {}),
+						},
 					} as const;
 				}, context);
 			},
 			dispatch: async (task, runtime, context) => {
-				const { seq, items, index } = task.state.checkpoint;
+				const { seq, items, index, quietFlushBackoffUntilMs } = task.state.checkpoint;
 				const current = items[index];
 				if (current === undefined) {
 					await runtime.commit(
-						() => ({ status: "running", checkpoint: { phase: "wait", seq } }) as const,
+						() =>
+							({
+								status: "running",
+								checkpoint: {
+									phase: "wait",
+									seq,
+									...(quietFlushBackoffUntilMs !== undefined ? { quietFlushBackoffUntilMs } : {}),
+								},
+							}) as const,
 						context,
 					);
 					return;
@@ -416,8 +565,24 @@ export function createRoutineSchedulerTask(options: CreateRoutineSchedulerTaskOp
 				await runtime.commit(
 					() =>
 						nextIndex < items.length
-							? ({ status: "running", checkpoint: { phase: "dispatch", seq, items, index: nextIndex } } as const)
-							: ({ status: "running", checkpoint: { phase: "wait", seq } } as const),
+							? ({
+									status: "running",
+									checkpoint: {
+										phase: "dispatch",
+										seq,
+										items,
+										index: nextIndex,
+										...(quietFlushBackoffUntilMs !== undefined ? { quietFlushBackoffUntilMs } : {}),
+									},
+								} as const)
+							: ({
+									status: "running",
+									checkpoint: {
+										phase: "wait",
+										seq,
+										...(quietFlushBackoffUntilMs !== undefined ? { quietFlushBackoffUntilMs } : {}),
+									},
+								} as const),
 					context,
 				);
 			},
@@ -434,23 +599,26 @@ export function createRoutineSchedulerTask(options: CreateRoutineSchedulerTaskOp
 			}, context);
 		},
 	});
+	return taskToken;
 }
 
 /** Type alias for the background single-flight routine scheduler durable task token. */
 export type RoutineSchedulerTaskToken = ReturnType<typeof createRoutineSchedulerTask>;
 
 /**
- * Ensures the single-flight `RoutineSchedulerTask` is aligned with `RoutineDoc` inside `tx`:
- * - Creates the background task if enabled routines exist and none is active;
- * - Wakes a sleeping task via `RoutineWakeSignal` if the schedule changed (new earlier routine or cancellation).
+ * Ensures the single-flight `RoutineSchedulerTask` is aligned with `RoutineDoc` (and any optional quiet-hours flush
+ * wake target `extraWakeAtMs`) inside `tx`:
+ * - Creates the background task if enabled routines or `extraWakeAtMs` exist and none is active;
+ * - Wakes a sleeping task via `RoutineWakeSignal` if the schedule changed (new earlier routine, cancellation, or held notification).
  */
 export async function syncRoutineSchedulerInTx(
 	tx: Tx,
 	taskToken: RoutineSchedulerTaskToken,
 	_nowMs: number,
+	extraWakeAtMs?: number,
 ): Promise<TaskId<null> | undefined> {
 	const doc = await tx.doc(RoutineDoc);
-	const earliest = findEarliestNextRunAtMs(doc);
+	const earliest = minDefined(findEarliestNextRunAtMs(doc), extraWakeAtMs);
 
 	if (doc.scheduledTaskId !== undefined) {
 		const existingId = doc.scheduledTaskId as TaskId<null>;
@@ -715,10 +883,34 @@ export type CreateRoutinesExtensionOptions = {
 	readonly getUtcOffsetMinutes: () => number;
 	readonly getNow: () => number;
 	readonly isRootConversation: (conversationId: ConversationId) => boolean;
+	/**
+	 * Optional callback returning the next epoch ms when held quiet-hours notifications should auto-flush.
+	 * Invoked inside `runtime.commit(tx)` so callers can read `tx.doc(HeldNotificationsDoc)` atomically with sleep/terminal transitions.
+	 */
+	readonly getNextQuietFlushAtMs?: (nowMs: number, tx?: Tx) => Promise<number | undefined>;
+	/** Optional callback invoked when `getNextQuietFlushAtMs(nowMs, tx) <= nowMs` to flush held quiet-hours notifications. */
+	readonly onQuietFlushDue?: (nowMs: number, context: Context) => Promise<void>;
+	/** Optional retry backoff (ms) when `onQuietFlushDue` or `getNextQuietFlushAtMs` fails transiently. Defaults to 60_000 ms. */
+	readonly quietFlushRetryBackoffMs?: number;
 };
 
 /** Creates the `"jehee.routines"` extension: background scheduler task, user-side clock anchor hook, and optional root tools. */
 export function createRoutinesExtension(options: CreateRoutinesExtensionOptions): Extension {
+	if (
+		options.getNextQuietFlushAtMs !== undefined ||
+		options.onQuietFlushDue !== undefined ||
+		options.quietFlushRetryBackoffMs !== undefined
+	) {
+		quietFlushBindings.set(options.schedulerTask, {
+			...(options.getNextQuietFlushAtMs !== undefined
+				? { getNextQuietFlushAtMs: options.getNextQuietFlushAtMs }
+				: {}),
+			...(options.onQuietFlushDue !== undefined ? { onQuietFlushDue: options.onQuietFlushDue } : {}),
+			...(options.quietFlushRetryBackoffMs !== undefined
+				? { quietFlushRetryBackoffMs: options.quietFlushRetryBackoffMs }
+				: {}),
+		});
+	}
 	const injectClock = options.enableClockAnchor ?? options.enableRoutineTools;
 	return defineExtension({
 		name: JEHEE_ROUTINES_EXTENSION_NAME,

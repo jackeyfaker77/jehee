@@ -193,6 +193,8 @@ export async function assembleNodeRuntime(
 			handoff: config.handoff,
 			utcOffsetMinutes: config.utcOffsetMinutes,
 			enableRoutines: true,
+			enableMedia: true,
+			...(config.quietPolicy?.quietHours !== undefined ? { quietHours: config.quietPolicy.quietHours } : {}),
 			autoResume: false,
 			...(mcp !== undefined ? { mcp } : {}),
 			...(workshop !== undefined ? { workshop } : {}),

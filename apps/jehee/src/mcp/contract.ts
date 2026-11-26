@@ -58,6 +58,21 @@ export type JeheeMcpOptions = {
 	readonly bestEffortConnect?: boolean;
 };
 
+/** Unreachable or failed MCP server recorded when connecting with `bestEffort` enabled. */
+export type FailedMcpServer = {
+	readonly name: string;
+	readonly error: string;
+};
+
+/** Outcome report produced when reconnecting configured MCP servers on a running host. */
+export type McpReconnectReport = {
+	readonly connected: readonly {
+		readonly name: string;
+		readonly toolCount: number;
+	}[];
+	readonly failed: readonly FailedMcpServer[];
+};
+
 /** Snapshot of one connected MCP server instance held by `McpConnectorHub`. */
 export type ConnectedMcpServer = {
 	readonly name: string;

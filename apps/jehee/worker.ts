@@ -169,6 +169,8 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 					handoff: config.handoff,
 					utcOffsetMinutes: config.utcOffsetMinutes,
 					enableRoutines: true,
+					enableMedia: true,
+					...(config.quietPolicy?.quietHours !== undefined ? { quietHours: config.quietPolicy.quietHours } : {}),
 					autoResume: false,
 					...(workerMcp !== undefined ? { mcp: workerMcp } : {}),
 					...(workshop !== undefined ? { workshop } : {}),

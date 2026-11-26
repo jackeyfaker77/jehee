@@ -10,10 +10,20 @@ import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { createRegistry } from "@earendil-works/pi-durable";
+import {
+	isJsonRpcNotification,
+	isJsonRpcRequest,
+	JSON_RPC_ERROR_CODES,
+	LATEST_PROTOCOL_VERSION,
+	type McpTransport,
+} from "@earendil-works/pi-mcp";
+import { createInMemoryTransportPair } from "@earendil-works/pi-mcp/testing";
 import type { StoredSpan } from "@earendil-works/pi-telemetry";
 import {
 	classifyFailureRootCause,
 	computeTraceMetrics,
+	createMcpBundle,
 	JEHEE_BLOB_HANDLE_PREFIX,
 	JeheeHost,
 	JeheeTraceRecorder,
@@ -27,6 +37,7 @@ import {
 	validateMcpServerSpecs,
 } from "../src/index.ts";
 import { stdioMcpServer } from "../src/mcp/node-stdio.ts";
+import { createOutboundMediaExtension, type OutboundMediaPayload, SEND_MEDIA_TOOL } from "../src/media/extension.ts";
 import { assembleNodeRuntime } from "../src/runtime/node.ts";
 import { createMockPaleEnvironment } from "./fixtures/pale-mcp-fixture.ts";
 
@@ -536,6 +547,307 @@ describe("MCP blob vault, metric dictionary, and stdio connector", () => {
 			}
 		} finally {
 			await host.close(BACKGROUND_CONTEXT);
+		}
+	});
+
+	it("records unreachable servers in McpConnectorHub.failedServers() with sanitized error messages", async () => {
+		const secretBearer = "sk:live:miu_secret_987654";
+		const secretApiKey = "sk-live-secret-112233";
+		const customSchemeSecret = "custom-scheme-secret-4455";
+		const urlQueryKey = "url-query-secret-6677";
+		const paleEnv = createMockPaleEnvironment({ pdfSizeBytes: 1_024, distractorServerCount: 0 });
+
+		const hub = await McpConnectorHub.connect(
+			[
+				{
+					name: "phone",
+					requestTimeoutMs: 1_000,
+					transport: {
+						kind: "http",
+						url: `https://offline-phone.invalid/mcp?key=${urlQueryKey}`,
+						headers: {
+							Authorization: `Bearer ${secretBearer}`,
+							"X-API-Key": secretApiKey,
+							"X-Custom-Auth": `Token ${customSchemeSecret}`,
+						},
+						openGetStream: false,
+						fetchImpl: async () => {
+							throw new Error(
+								`https://u:pw99@h.invalid/m?key=${urlQueryKey}&auth=qauth8&token=qtok9 {"token":"jtok1","api_key":"jkey2","authorization":"Bearer jauth3"} Bearer ${secretBearer} Bearer abcd:csec9 ${customSchemeSecret} X-API-Key:${secretApiKey}`,
+							);
+						},
+					},
+				},
+				paleEnv.mailSpec,
+			],
+			{ bestEffort: true },
+		);
+
+		try {
+			assert.deepEqual(
+				hub.servers().map((s) => s.name),
+				["mail"],
+			);
+			const failed = hub.failedServers();
+			assert.equal(failed.length, 1);
+			assert.equal(failed[0]!.name, "phone");
+			const err = failed[0]!.error;
+			assert.ok(err.length > 0);
+			assert.equal(err.endsWith("…"), false, `error should not be truncated in redaction test: ${err}`);
+			for (const leaked of [
+				secretBearer,
+				secretApiKey,
+				customSchemeSecret,
+				urlQueryKey,
+				"pw99",
+				"qauth8",
+				"qtok9",
+				"jtok1",
+				"jkey2",
+				"jauth3",
+				"csec9",
+			]) {
+				assert.equal(err.includes(leaked), false, `expected secret "${leaked}" to be redacted in: ${err}`);
+			}
+			assert.ok(err.includes("[redacted]"));
+		} finally {
+			await hub.close();
+		}
+	});
+
+	it("enforces bounded LRU eviction and base64url/invalid-base64 safety in McpBlobVault", () => {
+		const vault = new McpBlobVault({ maxEntries: 2, maxTotalBytes: 24 });
+		const b1 = Buffer.from("aaaaaaaaaa", "utf8").toString("base64"); // 10 bytes
+		const b2 = Buffer.from("bbbbbbbbbb", "utf8").toString("base64"); // 10 bytes
+		const b3 = Buffer.from("cccccccccc", "utf8").toString("base64"); // 10 bytes
+
+		const e1 = vault.storeBase64(b1, "image/png");
+		const e2 = vault.storeBase64(b2, "image/png");
+		assert.equal(vault.size, 2);
+		assert.equal(vault.totalBytes, 20);
+
+		// Touch e1 so e2 becomes LRU, then insert e3 -> e2 is evicted to stay within both maxEntries and maxTotalBytes.
+		assert.ok(vault.getBlob(e1.handle));
+		const e3 = vault.storeBase64(b3, "image/png");
+		assert.equal(vault.size, 2);
+		assert.equal(vault.totalBytes, 20);
+		assert.ok(vault.get(e1.handle));
+		assert.equal(vault.get(e2.handle), undefined);
+		assert.ok(vault.get(e3.handle));
+
+		// Base64URL (with -/_ and omitted padding) normalizes cleanly and decodes via getBlob.
+		const rawUrlBytes = new Uint8Array([0xfb, 0xff, 0xbf, 0x3e, 0x7f]);
+		const base64Url = Buffer.from(rawUrlBytes).toString("base64url");
+		const urlEntry = vault.tryStoreBase64(base64Url, "image/webp");
+		assert.ok(urlEntry);
+		const decodedUrl = vault.getBlob(urlEntry.handle);
+		assert.ok(decodedUrl);
+		assert.deepEqual(decodedUrl.bytes, rawUrlBytes);
+		assert.equal(decodedUrl.mimeType, "image/webp");
+
+		// Malformed base64 and payloads exceeding vault maxTotalBytes return undefined from tryStoreBase64 without crashing.
+		assert.equal(vault.tryStoreBase64("%%%invalid-base64%%%", "image/png"), undefined);
+		assert.equal(vault.tryStoreBase64(Buffer.alloc(32, 0x7a).toString("base64"), "image/png"), undefined);
+	});
+
+	it("exposes extensionHandles on McpBundle for clean registry swap and saves MCP ImageContent into blobVault for send_media", async () => {
+		const screenshotBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x10, 0x20, 0x30, 0x40]);
+		const screenshotBase64 = Buffer.from(screenshotBytes).toString("base64");
+
+		const createScreenshotServerTransport = (): McpTransport => {
+			const pair = createInMemoryTransportPair();
+			let initialized = false;
+			let ready = false;
+			pair.server.onMessage((msg) => {
+				if (isJsonRpcNotification(msg)) {
+					if (msg.method === "notifications/initialized" && initialized) ready = true;
+					return;
+				}
+				if (!isJsonRpcRequest(msg)) return;
+				const reply = (result: unknown) => {
+					void pair.server.send({ jsonrpc: "2.0", id: msg.id, result });
+				};
+				if (msg.method === "initialize") {
+					initialized = true;
+					reply({
+						protocolVersion: LATEST_PROTOCOL_VERSION,
+						capabilities: { tools: { listChanged: false } },
+						serverInfo: { name: "miu-bridge-mock", version: "0.1.0" },
+					});
+					return;
+				}
+				if (!ready) {
+					void pair.server.send({
+						jsonrpc: "2.0",
+						id: msg.id,
+						error: { code: -32002, message: "not ready" },
+					});
+					return;
+				}
+				if (msg.method === "tools/list") {
+					reply({
+						tools: [
+							{
+								name: "phone_screenshot",
+								description: "Capture the current Android phone screen as a PNG image.",
+								annotations: { readOnlyHint: true },
+								inputSchema: { type: "object", properties: {}, additionalProperties: false },
+							},
+							{
+								name: "bad_screenshot",
+								description: "Returns malformed base64 image data.",
+								annotations: { readOnlyHint: true },
+								inputSchema: { type: "object", properties: {}, additionalProperties: false },
+							},
+						],
+					});
+					return;
+				}
+				if (msg.method === "tools/call") {
+					const params =
+						typeof msg.params === "object" && msg.params !== null ? (msg.params as Record<string, unknown>) : {};
+					if (params.name === "bad_screenshot") {
+						reply({
+							content: [{ type: "image", data: "!!!malformed-base64!!!", mimeType: "image/png" }],
+						});
+						return;
+					}
+					reply({
+						content: [
+							{ type: "image", data: screenshotBase64, mimeType: "image/png" },
+							{ type: "text", text: "Captured 1080x2400 PNG screenshot." },
+						],
+					});
+					return;
+				}
+				void pair.server.send({
+					jsonrpc: "2.0",
+					id: msg.id,
+					error: { code: JSON_RPC_ERROR_CODES.methodNotFound, message: `Unknown method: ${msg.method}` },
+				});
+			});
+			void pair.server.start();
+			return pair.client;
+		};
+
+		const hub = await McpConnectorHub.connect([
+			{
+				name: "phone",
+				description: "Miu Bridge Android phone control",
+				transport: { kind: "custom", create: createScreenshotServerTransport },
+			},
+		]);
+
+		try {
+			const deferredBundle = createMcpBundle(hub, { exposure: "deferred" });
+			assert.equal(deferredBundle.extensionHandles.length, 2);
+			const registry = createRegistry();
+			for (const ext of deferredBundle.extensions) {
+				registry.install(ext);
+			}
+			assert.equal(registry.snapshot().installed().length, 2);
+			for (const handle of deferredBundle.extensionHandles) {
+				registry.uninstall(handle);
+			}
+			assert.equal(registry.snapshot().installed().length, 0);
+
+			const eagerBundle = createMcpBundle(hub, { exposure: "eager" });
+			assert.equal(eagerBundle.extensionHandles.length, 1);
+
+			const deliveredMedia: OutboundMediaPayload[] = [];
+			const mediaExtension = createOutboundMediaExtension({
+				resolveBlob: (handle) => eagerBundle.blobVault.getBlob(handle),
+				deliverMedia: async (payload) => {
+					deliveredMedia.push(payload);
+					return { ok: true, route: "telegram:owner-1" };
+				},
+			});
+
+			let extractedBlobHandle = "";
+			let sawImageBlock = false;
+			let badImageHadHandleNote = true;
+			const faux = fauxProvider();
+			faux.setResponses([
+				() =>
+					fauxAssistantMessage(
+						[fauxToolCall("mcp__phone__phone_screenshot", {}), fauxToolCall("mcp__phone__bad_screenshot", {})],
+						{ stopReason: "toolUse" },
+					),
+				(ctx) => {
+					const toolResults = ctx.messages.filter((m) => m.role === "toolResult");
+					assert.equal(toolResults.length, 2);
+					const goodResult = toolResults[0]!;
+					sawImageBlock = goodResult.content.some((b) => b.type === "image" && b.mimeType === "image/png");
+					const joinedText = goodResult.content
+						.filter((b) => b.type === "text")
+						.map((b) => b.text)
+						.join("\n");
+					const match =
+						/\[Saved image handle: (\$jehee_blob:[0-9a-f]+) — pass to send_media to deliver to user\]/.exec(
+							joinedText,
+						);
+					assert.ok(match?.[1], `expected saved image handle note in: ${joinedText}`);
+					extractedBlobHandle = match[1];
+
+					const badResult = toolResults[1]!;
+					assert.equal(badResult.isError, false);
+					assert.equal(
+						badResult.content.some((b) => b.type === "image" && b.mimeType === "image/png"),
+						true,
+					);
+					const badText = badResult.content
+						.filter((b) => b.type === "text")
+						.map((b) => b.text)
+						.join("\n");
+					badImageHadHandleNote = badText.includes(JEHEE_BLOB_HANDLE_PREFIX);
+
+					return fauxAssistantMessage(
+						[
+							fauxToolCall(SEND_MEDIA_TOOL, {
+								kind: "photo",
+								blobHandle: extractedBlobHandle,
+								caption: "Phone screen",
+							}),
+						],
+						{ stopReason: "toolUse" },
+					);
+				},
+				() => fauxAssistantMessage("Screenshot sent to Telegram."),
+			]);
+
+			const models = createModels();
+			models.setProvider(faux.provider);
+
+			const host = await JeheeHost.open(
+				{
+					storage: { kind: "memory" },
+					models,
+					defaultModel: { provider: "faux", modelId: faux.getModel().id },
+					extensions: [...eagerBundle.extensions, mediaExtension],
+				},
+				BACKGROUND_CONTEXT,
+			);
+
+			try {
+				const reply = await host.sendMessage(
+					{ text: "Take a phone screenshot and send it to me" },
+					BACKGROUND_CONTEXT,
+				);
+				assert.equal(reply.status, "done");
+			} finally {
+				await host.close(BACKGROUND_CONTEXT);
+			}
+
+			assert.equal(sawImageBlock, true);
+			assert.equal(badImageHadHandleNote, false);
+			assert.ok(extractedBlobHandle.startsWith(JEHEE_BLOB_HANDLE_PREFIX));
+			assert.equal(deliveredMedia.length, 1);
+			assert.equal(deliveredMedia[0]!.kind, "photo");
+			assert.equal(deliveredMedia[0]!.mimeType, "image/png");
+			assert.equal(deliveredMedia[0]!.caption, "Phone screen");
+			assert.deepEqual(deliveredMedia[0]!.bytes, screenshotBytes);
+		} finally {
+			await hub.close();
 		}
 	});
 });

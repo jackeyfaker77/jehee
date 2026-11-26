@@ -58,6 +58,7 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [ADR-0013](./adr/0013-seamless-window-handoff.md) | 单窗口无感换窗（Seamless Handoff）、换窗前记忆落盘与底层原话回查（Slice 5D） | Accepted | 2026-11-24 | 基于 `pi-durable` 原生 `CompactionTask` + `Conversation.reset(handoff)` 实现甜点水位自动压缩与 `/handoff` 整窗交接，通过 `beforeCompact` 先落盘 5C-2 原子记忆，并提供跨换窗 `history_search` 原话回查工具与 `Eval-0003` 双轨评测。 |
 | [ADR-0014](./adr/0014-proactive-routines-and-clock.md) | 主动定时提醒、周期例行任务、尾部本地时钟锚点、持久化投递路由与 DO Alarm 守护（Slice 6A） | Accepted | 2026-11-25 | 基于单活 `RoutineSchedulerTask` + `RoutineWakeSignal` 与 `RoutineDoc` / `LastRouteDoc` 实现 `once`/`daily`/`weekly`/`interval` 定时任务、`direct_notify` 零 Token 直推与 `agent_prompt` `[SILENT]` 抑制、用户侧不可变本地时钟锚点、`/routines` 指令及 Cloudflare DO `alarm()` `ctx.waitUntil` 守护。 |
 | [ADR-0015](./adr/0015-multimodal-channels-and-web-fetch.md) | Telegram 多模态收发通道与防 SSRF 可移植 `web_fetch` 工具（Slice 6B） | Accepted | 2026-11-25 | 扩展 `ChannelAttachment` / `downloadFile` / `sendPhoto` / `sendDocument` 多模态契约与 `ChannelGateway` 附件下载、防抖保留与 `ImageContent` 多段入站；实现双栖零 Node 依赖且覆盖 IPv4/IPv6/重定向的防 SSRF 只读 `web_fetch` 扩展与工坊子会话隔离。 |
+| [ADR-0016](./adr/0016-resilient-pa-ops-and-outbound-media.md) | 静默时段持久化自动补发、MCP 自愈重连、运行时模型热切与出站富媒体交付（Slice 6C） | Accepted | 2026-11-26 | 落地会话级 `HeldNotificationsDoc` 与单活调度器静默窗口结束自动补发、`/mcp` 脱敏失败诊断与 `/mcp reconnect` 原子热替换、`RuntimeModelDoc` 持久化 `/model` 热切，以及直连 `McpBlobVault` 的可移植 `send_media` 出站富媒体扩展与工坊子会话隔离。 |
 
 ### 评测结论与失败复盘记录（Evals & Postmortems）
 
@@ -70,6 +71,7 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 | [Eval-0003](./evals/0005-handoff-eval-and-postmortem.md) | 单窗口无感换窗（`No-Handoff` vs `Seamless Handoff` 5D）双轨对比评测与复盘 | [ADR-0013](./adr/0013-seamless-window-handoff.md) | 2026-11-24 | `opencode-go/deepseek-v4.1-flash` 真机与离线双轨实测：`No-Handoff` `50%`（离线 `33.3%`，活跃窗口涨至 `3613` tok）-> `Seamless Handoff` `100%`（活跃窗口压降至 `778` tok，`-78.5%`，换窗重启后经 `history_search` 零失真逐字回查 `entryId=7` 原话），并归档 6 项问题留痕。 |
 | [Eval-0004](./evals/0006-prod-atomic-memory-switch-eval.md) | 线上 Worker 记忆切换前后对比评测（`static-core` -> `atomic + idle 10m`） | [ADR-0010](./adr/0010-atomic-memory-and-eval.md)–[0013](./adr/0013-seamless-window-handoff.md) | 2026-11-24 | 真机对比 `wrangler.jsonc` 切换前后：评分 `50% -> 100%`，换窗冷重启后从 `5` 次暴力 `history_search` 降至 `2` 次精准 `memory_search`，首轮工具 Schema 增量 `+785` tok、全程账单 `+\$0.00085`，确认 DO 10 分钟空闲 Alarm 休眠收口 `active: false` 后完成线上发布（`bbc62ecb`）。 |
 | [Audit-0007](./evals/0007-slice-6a-6b-audit-and-postmortem.md) | Slice 6A + 6B 联合集成审计、全量门禁实测与 4 项审查缺陷复盘 | [ADR-0014](./adr/0014-proactive-routines-and-clock.md)–[0015](./adr/0015-multimodal-channels-and-web-fetch.md) | 2026-11-25 | 汇总 Slice 6A（主动 Routines + 本地时钟锚点 + DO Alarm 守护）与 Slice 6B（Telegram 多模态收发 + 防 SSRF `web_fetch`）全量门禁、单测、BDD 与四项离线 Eval 结果，并按四要素归档审校阶段捕获的 4 项真实缺陷（IPv6 SSRF 绕过、图片 MIME 优先级与 SVG 路由、冷启动提前 `resume` 丢提醒、瞬态出站异常击穿单活调度器）。 |
+| [Audit-0008](./evals/0008-slice-6c-audit-and-postmortem.md) | Slice 6C 联合集成审计、全量门禁实测与 5 项缺陷复盘 | [ADR-0016](./adr/0016-resilient-pa-ops-and-outbound-media.md) | 2026-11-27 | 汇总 Slice 6C（持久化静默自动补发、`/mcp` 自愈重连、持久化 `/model` 热切与 `send_media` 出站富媒体）全量门禁、单测、BDD 与四项离线 Eval 实测，并按四要素留痕 Windows `git worktree` `MAX_PATH` 限制、MCP 凭据脱敏补漏、`McpBlobVault`/`send_media` 安全加固、`RoutineSchedulerTask` 事务级唤醒竞态与 Windows `share` 工作树清理跨越 NTFS Junction 误删根工作区上游包恢复复盘。 |
 
 ---
 
@@ -110,4 +112,4 @@ Jehee 是基于 `@earendil-works/pi-durable` 构建的 **7×24 常驻个人伙�
 
 ## 4. 后续计划立项队列
 
-- 暂无待立项核心切片（Slice 1–6B 覆盖 PRD 全部四大功能板块及主动例行任务、多模态渠道与防 SSRF 网页抓取，后续按真实 7×24 使用反馈迭代运行态 `/model` 热切、语音转写或新渠道适配器）。
+- 暂无待立项核心切片（Slice 1–6C 覆盖 PRD 全部四大功能板块及主动例行任务、多模态双向收发、防 SSRF 网页抓取、静默持久化自动补发、MCP 自愈重连与运行态 `/model` 热切，后续按真实 7×24 使用反馈迭代语音转写或新渠道适配器）。

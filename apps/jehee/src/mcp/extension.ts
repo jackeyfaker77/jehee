@@ -31,6 +31,11 @@ import type { McpConnectorHub } from "./hub.ts";
 /** Fixed extension name for Jehee's MCP connector layer. */
 export const JEHEE_MCP_EXTENSION_NAME = "jehee.mcp";
 
+/** Extension handle referencing `"jehee.mcp"` for `registry.uninstall(...)` or `configure({ extensions: { remove } })`. */
+export const JEHEE_MCP_EXTENSION_HANDLE: Extension = defineExtension({
+	name: JEHEE_MCP_EXTENSION_NAME,
+});
+
 /** Standard resource listing tool name aligned with Codex/OpenCode model priors. */
 export const LIST_MCP_RESOURCES_TOOL = "list_mcp_resources";
 
@@ -43,6 +48,7 @@ export const READ_MCP_RESOURCE_TOOL = "read_mcp_resource";
 /** Assembled `pi-durable` extensions and shared `McpBlobVault` produced for an `McpConnectorHub`. */
 export type JeheeMcpBundle = {
 	readonly extensions: readonly Extension[];
+	readonly extensionHandles: readonly Extension[];
 	readonly mcpExtension: Extension;
 	readonly blobVault: McpBlobVault;
 };
@@ -266,6 +272,13 @@ function createResourceTools(
 						if (shaped.offloaded) anyOffloaded = true;
 						if (shaped.kind === "image") {
 							llmBlocks.push({ type: "image", data: shaped.data, mimeType: shaped.mimeType });
+							const stored = blobVault.tryStoreBase64(shaped.data, shaped.mimeType);
+							if (stored !== undefined) {
+								llmBlocks.push({
+									type: "text",
+									text: `[Saved image handle: ${stored.handle} — pass to send_media to deliver to user]`,
+								});
+							}
 						} else {
 							llmBlocks.push({ type: "text", text: shaped.text });
 						}
@@ -426,12 +439,23 @@ function createBusinessToolRegistration(params: {
 					const result = await server.callTool(rawTool.name, expandedArgs, context.abortSignal);
 					const rawBlocks = toLlmContent(result);
 					let totalOffloadedBytes = 0;
-					const shapedBlocks: LlmContent[] = rawBlocks.map((block) => {
-						if (block.type !== "text") return block;
-						const shaped = blobVault.shapeToolResultText(block.text, thresholdBytes);
-						totalOffloadedBytes += shaped.offloadedBytes;
-						return { type: "text", text: shaped.text };
-					});
+					const shapedBlocks: LlmContent[] = [];
+					for (const block of rawBlocks) {
+						if (block.type === "text") {
+							const shaped = blobVault.shapeToolResultText(block.text, thresholdBytes);
+							totalOffloadedBytes += shaped.offloadedBytes;
+							shapedBlocks.push({ type: "text", text: shaped.text });
+						} else {
+							shapedBlocks.push(block);
+							const stored = blobVault.tryStoreBase64(block.data, block.mimeType);
+							if (stored !== undefined) {
+								shapedBlocks.push({
+									type: "text",
+									text: `[Saved image handle: ${stored.handle} — pass to send_media to deliver to user]`,
+								});
+							}
+						}
+					}
 
 					if (result.isError === true && shapedBlocks.length === 0) {
 						const fallback =
@@ -527,6 +551,7 @@ export function createMcpBundle(hub: McpConnectorHub, options?: Omit<JeheeMcpOpt
 
 	return {
 		extensions,
+		extensionHandles: [...extensions],
 		mcpExtension,
 		blobVault,
 	};

@@ -2,7 +2,7 @@
 // crash recovery, and hot-swappable memory providers on top of pi-durable. Kept 100% Web/Edge portable (no node:sqlite
 // or child_process imports) so the exact same class powers both Node 24 and Cloudflare Workers Durable Objects.
 
-import type { Context } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import type { AssistantMessage, ImageContent, Models } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
@@ -26,6 +26,7 @@ import {
 	type Submission,
 	type SubmissionId,
 	type TaskId,
+	type Tx,
 	UsageDoc,
 	UserEntry,
 	type Wake,
@@ -53,9 +54,34 @@ import {
 	type ApprovalTicket,
 	pruneExpiredTickets,
 } from "../governance/approvals.ts";
-import type { JeheeMcpOptions } from "../mcp/contract.ts";
-import { createMcpBundle } from "../mcp/extension.ts";
+import {
+	type AvailableModelEntry,
+	appendHeldNotificationInState,
+	cloneModelRef,
+	createEmptyHeldNotificationsState,
+	drainHeldNotificationsInState,
+	HeldNotificationsDoc,
+	listHeldNotificationsFromState,
+	type ModelStatusSummary,
+	parseModelRefSpec,
+	RuntimeModelDoc,
+	readRuntimeModelOverride,
+} from "../governance/durable-store.ts";
+import {
+	computeNextQuietEndMs,
+	type HeldProactiveMessage,
+	isWithinQuietHours,
+	type QuietHoursWindow,
+} from "../governance/quiet-gate.ts";
+import type { JeheeMcpOptions, McpReconnectReport } from "../mcp/contract.ts";
+import { createMcpBundle, type JeheeMcpBundle } from "../mcp/extension.ts";
 import { McpConnectorHub } from "../mcp/hub.ts";
+import {
+	createOutboundMediaExtension,
+	JEHEE_MEDIA_EXTENSION_NAME,
+	type OutboundMediaDeliveryResult,
+	type OutboundMediaPayload,
+} from "../media/extension.ts";
 import { createEmptyMemoryStoreState } from "../memory/atomic-memory.ts";
 import {
 	createMemoryConsolidatorTask,
@@ -160,6 +186,12 @@ export type JeheeHostOptions = {
 	readonly enableWebFetch?: boolean;
 	/** Optional configuration overrides for the built-in `"jehee.web"` (`web_fetch`) extension. */
 	readonly webFetch?: CreateWebExtensionOptions;
+	/** Explicit toggle for eager `send_media` tool. Defaults to enabled when routines, atomic memory, or handoff is mounted. */
+	readonly enableMedia?: boolean;
+	/** Optional quiet-hours window used by the durable scheduler to compute automatic quiet-end flush wakeups. */
+	readonly quietHours?: QuietHoursWindow;
+	/** Optional retry backoff (ms) for failed quiet-hours auto-flush attempts (defaults to 60_000 ms). */
+	readonly quietFlushRetryBackoffMs?: number;
 	readonly mcp?: JeheeMcpOptions;
 	readonly workshop?: JeheeWorkshopOptions;
 	readonly extensions?: readonly Extension[];
@@ -226,6 +258,41 @@ export type ProactiveReplyListener = (
 	answerEntryId: EntryId,
 	options?: { readonly urgency?: "normal" | "urgent" },
 ) => void | Promise<void>;
+
+/** Listener notified by the durable scheduler when quiet hours end and held notifications are due for automatic flush. */
+export type QuietFlushListener = (nowMs: number, context: Context) => void | Promise<void>;
+
+/** Optional metadata provided when registering a quiet-hours auto-flush listener on `JeheeHost`. */
+export type QuietFlushSubscriptionOptions = {
+	readonly quietHours?: QuietHoursWindow;
+};
+
+/** Channel-layer callback delivering a validated outbound photo or document emitted by `send_media`. */
+export type OutboundMediaHandler = (
+	payload: OutboundMediaPayload,
+	context: Context,
+) => Promise<OutboundMediaDeliveryResult>;
+
+/** Outcome of hot-swapping the active runtime model via `JeheeHost.setModel`. */
+export type SetModelResult =
+	| {
+			readonly ok: true;
+			readonly model: ModelRef;
+			readonly previous: ModelRef;
+			readonly updatedAtMs: number;
+	  }
+	| {
+			readonly ok: false;
+			readonly reason: "invalid_format" | "unknown_provider" | "unknown_model";
+			readonly message: string;
+	  };
+
+/** Outcome of resetting the active runtime model back to the startup default via `JeheeHost.resetModel`. */
+export type ResetModelResult = {
+	readonly ok: true;
+	readonly model: ModelRef;
+	readonly wasOverride: boolean;
+};
 
 /** Outcome of resolving (`approve` or `reject`) a durable write-approval ticket on `JeheeHost`. */
 export type ResolveApprovalResult =
@@ -319,12 +386,20 @@ export class JeheeHost {
 	readonly #root: Conversation;
 	readonly #models: Models;
 	readonly #defaultModel: ModelRef;
+	readonly #activeModelHolder: { current: ModelRef };
 	readonly #telemetry: TelemetryContext | undefined;
 	readonly #traceRecorder: JeheeTraceRecorder | undefined;
 	readonly #proactiveListeners: Set<ProactiveReplyListener>;
 	readonly #directNotifyListeners: Set<DirectNotifyListener>;
 	readonly #approvalListeners: Set<ApprovalRequestListener>;
-	readonly #mcpHub: McpConnectorHub | undefined;
+	readonly #quietFlushListeners: Set<QuietFlushListener>;
+	readonly #quietHoursHolder: { current: QuietHoursWindow | undefined; nextHintMs: number | undefined };
+	readonly #initialQuietHours: QuietHoursWindow | undefined;
+	readonly #outboundMediaHandler: { current: OutboundMediaHandler | undefined };
+	readonly #mcpOptions: JeheeMcpOptions | undefined;
+	readonly #mcpState: { hub: McpConnectorHub | undefined; bundle: JeheeMcpBundle | undefined };
+	readonly #removedOnRoot: readonly Extension[] | undefined;
+	#mcpReconnectChain: Promise<unknown> = Promise.resolve();
 	readonly #now: () => number;
 	readonly #utcOffsetMinutes: number;
 	readonly #memoryHolder: { current: MemoryProvider | undefined };
@@ -341,6 +416,7 @@ export class JeheeHost {
 		root: Conversation,
 		models: Models,
 		defaultModel: ModelRef,
+		activeModelHolder: { current: ModelRef },
 		telemetry: TelemetryContext | undefined,
 		traceRecorder: JeheeTraceRecorder | undefined,
 		memoryHolder: { current: MemoryProvider | undefined },
@@ -353,7 +429,13 @@ export class JeheeHost {
 		proactiveListeners: Set<ProactiveReplyListener>,
 		directNotifyListeners: Set<DirectNotifyListener>,
 		approvalListeners: Set<ApprovalRequestListener>,
-		mcpHub: McpConnectorHub | undefined,
+		quietFlushListeners: Set<QuietFlushListener>,
+		quietHoursHolder: { current: QuietHoursWindow | undefined; nextHintMs: number | undefined },
+		initialQuietHours: QuietHoursWindow | undefined,
+		outboundMediaHandler: { current: OutboundMediaHandler | undefined },
+		mcpOptions: JeheeMcpOptions | undefined,
+		mcpState: { hub: McpConnectorHub | undefined; bundle: JeheeMcpBundle | undefined },
+		removedOnRoot: readonly Extension[] | undefined,
 		now: () => number,
 		utcOffsetMinutes: number,
 	) {
@@ -362,6 +444,7 @@ export class JeheeHost {
 		this.#root = root;
 		this.#models = models;
 		this.#defaultModel = defaultModel;
+		this.#activeModelHolder = activeModelHolder;
 		this.#telemetry = telemetry;
 		this.#traceRecorder = traceRecorder;
 		this.#memoryHolder = memoryHolder;
@@ -374,7 +457,13 @@ export class JeheeHost {
 		this.#proactiveListeners = proactiveListeners;
 		this.#directNotifyListeners = directNotifyListeners;
 		this.#approvalListeners = approvalListeners;
-		this.#mcpHub = mcpHub;
+		this.#quietFlushListeners = quietFlushListeners;
+		this.#quietHoursHolder = quietHoursHolder;
+		this.#initialQuietHours = initialQuietHours;
+		this.#outboundMediaHandler = outboundMediaHandler;
+		this.#mcpOptions = mcpOptions;
+		this.#mcpState = mcpState;
+		this.#removedOnRoot = removedOnRoot;
 		this.#now = now;
 		this.#utcOffsetMinutes = utcOffsetMinutes;
 	}
@@ -386,6 +475,17 @@ export class JeheeHost {
 		const proactiveListeners = new Set<ProactiveReplyListener>();
 		const directNotifyListeners = new Set<DirectNotifyListener>();
 		const approvalListeners = new Set<ApprovalRequestListener>();
+		const quietFlushListeners = new Set<QuietFlushListener>();
+		const quietHoursHolder: { current: QuietHoursWindow | undefined; nextHintMs: number | undefined } = {
+			current: options.quietHours,
+			nextHintMs: undefined,
+		};
+		const outboundMediaHandler: { current: OutboundMediaHandler | undefined } = { current: undefined };
+		const mcpState: { hub: McpConnectorHub | undefined; bundle: JeheeMcpBundle | undefined } = {
+			hub: undefined,
+			bundle: undefined,
+		};
+		const activeModelHolder: { current: ModelRef } = { current: cloneModelRef(options.defaultModel) };
 		const nowFn = options.now ?? Date.now;
 		const utcOffsetMinutes = options.utcOffsetMinutes ?? DEFAULT_UTC_OFFSET_MINUTES;
 		const traceRecorder =
@@ -417,6 +517,31 @@ export class JeheeHost {
 		});
 		let harnessRef: Harness | undefined;
 		let rootRef: Conversation | undefined;
+		const computeNextQuietFlushAtMs = async (nowMs: number, tx?: Tx): Promise<number | undefined> => {
+			if (quietFlushListeners.size === 0) return undefined;
+			const doc =
+				tx !== undefined
+					? await tx.doc(HeldNotificationsDoc)
+					: await harnessRef?.snapshot(HeldNotificationsDoc, BACKGROUND_CONTEXT);
+			if (doc === undefined || doc.items.length === 0) {
+				quietHoursHolder.nextHintMs = undefined;
+				return undefined;
+			}
+			const hasQuietHeld = doc.items.some((item) => item.reason === "quiet_hours");
+			if (!hasQuietHeld) {
+				quietHoursHolder.nextHintMs = undefined;
+				return undefined;
+			}
+			if (quietHoursHolder.current !== undefined) {
+				return isWithinQuietHours(nowMs, quietHoursHolder.current)
+					? computeNextQuietEndMs(quietHoursHolder.current, nowMs)
+					: nowMs;
+			}
+			if (quietHoursHolder.nextHintMs !== undefined) {
+				return quietHoursHolder.nextHintMs;
+			}
+			return nowMs;
+		};
 		const runPreHandoffConsolidation = async (hookCtx: Context): Promise<boolean> => {
 			if (rootRef === undefined) return false;
 			const atomic = memoryHolder.current?.atomic;
@@ -427,7 +552,7 @@ export class JeheeHost {
 					conversationId: rootRef.id,
 					atomic,
 					models: options.models,
-					defaultModel: options.defaultModel,
+					defaultModel: activeModelHolder.current,
 					now: nowFn,
 					...(effectiveTelemetry !== undefined ? { telemetry: effectiveTelemetry } : {}),
 					commit: (change, ctx) => rootRef!.commit(change, ctx),
@@ -475,7 +600,7 @@ export class JeheeHost {
 			createContextExtension({
 				enableHistoryTool: options.memory?.atomic !== undefined || options.handoff !== undefined,
 				getPolicy: () => handoffPolicy,
-				getDefaultModel: () => options.defaultModel,
+				getDefaultModel: () => activeModelHolder.current,
 				getModels: () => options.models,
 				getNow: nowFn,
 				getTelemetry: () => effectiveTelemetry,
@@ -512,6 +637,15 @@ export class JeheeHost {
 				getUtcOffsetMinutes: () => utcOffsetMinutes,
 				getNow: nowFn,
 				isRootConversation: (convId) => rootRef !== undefined && convId === rootRef.id,
+				getNextQuietFlushAtMs: computeNextQuietFlushAtMs,
+				onQuietFlushDue: async (dueAtMs, ctx) => {
+					for (const listener of [...quietFlushListeners]) {
+						await listener(dueAtMs, ctx);
+					}
+				},
+				...(options.quietFlushRetryBackoffMs !== undefined
+					? { quietFlushRetryBackoffMs: options.quietFlushRetryBackoffMs }
+					: {}),
 			}),
 		);
 		const hasCustomWebExtension = (options.extensions ?? []).some((ext) => ext.name === JEHEE_WEB_EXTENSION_NAME);
@@ -527,20 +661,38 @@ export class JeheeHost {
 				}),
 			);
 		}
+		const hasCustomMediaExtension = (options.extensions ?? []).some((ext) => ext.name === JEHEE_MEDIA_EXTENSION_NAME);
+		if (!hasCustomMediaExtension) {
+			const enableMedia =
+				options.enableMedia ??
+				(options.enableRoutines === true || options.memory?.atomic !== undefined || options.handoff !== undefined);
+			registry.install(
+				createOutboundMediaExtension({
+					enabled: enableMedia,
+					resolveBlob: (handle) => mcpState.bundle?.blobVault.getBlob(handle),
+					deliverMedia: async (payload, ctx) => {
+						const handler = outboundMediaHandler.current;
+						if (handler === undefined) {
+							return { ok: false, reason: "No outbound media handler registered on this host." };
+						}
+						return handler(payload, ctx);
+					},
+				}),
+			);
+		}
 		if (options.memory !== undefined) {
 			registry.install(createMemoryExtension(options.memory, { onRootTurnCompleted }));
 			registry.install(createMemoryToolsExtension(options.memory, consolidatorTask));
 		} else {
 			registry.install(createMemoryToolsExtension(undefined, consolidatorTask));
 		}
-		let mcpHub: McpConnectorHub | undefined;
 		if (options.mcp !== undefined) {
-			mcpHub = await McpConnectorHub.connect(options.mcp.servers, {
+			mcpState.hub = await McpConnectorHub.connect(options.mcp.servers, {
 				...(options.mcp.bestEffortConnect === true ? { bestEffort: true } : {}),
 			});
-			if (mcpHub.servers().length > 0) {
+			if (mcpState.hub.servers().length > 0) {
 				const callerApprovalListener = options.mcp.onApprovalRequested;
-				const mcpBundle = createMcpBundle(mcpHub, {
+				mcpState.bundle = createMcpBundle(mcpState.hub, {
 					...options.mcp,
 					onApprovalRequested: async (ticket) => {
 						if (callerApprovalListener !== undefined) {
@@ -551,7 +703,7 @@ export class JeheeHost {
 						}
 					},
 				});
-				for (const ext of mcpBundle.extensions) {
+				for (const ext of mcpState.bundle.extensions) {
 					registry.install(ext);
 				}
 			}
@@ -612,11 +764,19 @@ export class JeheeHost {
 				context,
 			);
 			harnessRef = harness;
+			const persistedModelDoc = await harness.snapshot(RuntimeModelDoc, context);
+			const persistedOverride = persistedModelDoc?.override;
+			const initialActiveModel: ModelRef =
+				persistedOverride !== undefined &&
+				options.models.getModel(persistedOverride.provider, persistedOverride.modelId) !== undefined
+					? cloneModelRef(persistedOverride)
+					: cloneModelRef(options.defaultModel);
+			activeModelHolder.current = initialActiveModel;
 			const removedOnRoot =
 				workshopBundle?.sandboxExtension !== undefined ? [workshopBundle.sandboxExtension] : undefined;
 			const root = await harness.root(context, {
 				agent: {
-					model: options.defaultModel,
+					model: initialActiveModel,
 					instructions: options.instructions,
 					cwd: options.cwd,
 					...(removedOnRoot !== undefined ? { extensions: { remove: removedOnRoot } } : {}),
@@ -625,7 +785,7 @@ export class JeheeHost {
 			rootRef = root;
 			await root.configure(
 				{
-					model: options.defaultModel,
+					model: initialActiveModel,
 					...(options.instructions !== undefined ? { instructions: options.instructions } : {}),
 					...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
 					...(removedOnRoot !== undefined ? { extensions: { remove: removedOnRoot } } : {}),
@@ -640,7 +800,8 @@ export class JeheeHost {
 				registry,
 				root,
 				options.models,
-				options.defaultModel,
+				cloneModelRef(options.defaultModel),
+				activeModelHolder,
 				effectiveTelemetry,
 				traceRecorder,
 				memoryHolder,
@@ -653,12 +814,18 @@ export class JeheeHost {
 				proactiveListeners,
 				directNotifyListeners,
 				approvalListeners,
-				mcpHub,
+				quietFlushListeners,
+				quietHoursHolder,
+				options.quietHours,
+				outboundMediaHandler,
+				options.mcp,
+				mcpState,
+				removedOnRoot,
 				nowFn,
 				utcOffsetMinutes,
 			);
 		} catch (error) {
-			await mcpHub?.close();
+			await mcpState.hub?.close();
 			throw error;
 		}
 	}
@@ -675,7 +842,251 @@ export class JeheeHost {
 
 	/** Configured names of currently connected MCP servers (empty when no MCP servers are mounted). */
 	get mcpServerNames(): readonly string[] {
-		return this.#mcpHub?.servers().map((server) => server.name) ?? [];
+		return this.#mcpState.hub?.servers().map((server) => server.name) ?? [];
+	}
+
+	/** Snapshot of connected MCP servers (with tool counts) and sanitized failed-server diagnostics. */
+	getMcpStatus(): McpReconnectReport {
+		const hub = this.#mcpState.hub;
+		if (hub === undefined) {
+			return { connected: [], failed: [] };
+		}
+		return {
+			connected: hub.servers().map((server) => ({
+				name: server.name,
+				toolCount: server.tools.length,
+			})),
+			failed: hub.failedServers().map((server) => ({
+				name: server.name,
+				error: server.error,
+			})),
+		};
+	}
+
+	/**
+	 * Safely closes the current MCP bundle, reconnects all configured MCP servers (`bestEffort: true`),
+	 * atomically swaps old/new MCP extensions in `Registry` and `AgentDoc`, and refreshes the active `McpBlobVault`.
+	 * Concurrent invocations are serialized to avoid registry or transport races.
+	 */
+	async reconnectMcp(context: Context): Promise<McpReconnectReport> {
+		if (this.#mcpOptions === undefined || this.#mcpOptions.servers.length === 0) {
+			return { connected: [], failed: [] };
+		}
+		const run = async (): Promise<McpReconnectReport> => {
+			const mcpOptions = this.#mcpOptions!;
+			const oldHub = this.#mcpState.hub;
+			const oldHandles = this.#mcpState.bundle?.extensionHandles ?? [];
+
+			await oldHub?.close().catch(() => undefined);
+
+			const newHub = await McpConnectorHub.connect(mcpOptions.servers, { bestEffort: true });
+			const callerApprovalListener = mcpOptions.onApprovalRequested;
+			const newBundle =
+				newHub.servers().length > 0
+					? createMcpBundle(newHub, {
+							...mcpOptions,
+							onApprovalRequested: async (ticket) => {
+								if (callerApprovalListener !== undefined) {
+									await callerApprovalListener(ticket);
+								}
+								for (const listener of this.#approvalListeners) {
+									await listener(ticket);
+								}
+							},
+						})
+					: undefined;
+
+			for (const oldHandle of oldHandles) {
+				this.#registry.uninstall(oldHandle);
+			}
+			for (const ext of newBundle?.extensions ?? []) {
+				this.#registry.install(ext);
+			}
+
+			this.#mcpState.hub = newHub;
+			this.#mcpState.bundle = newBundle;
+
+			const extensionChange =
+				newBundle !== undefined
+					? {
+							add: newBundle.extensionHandles,
+							...(this.#removedOnRoot !== undefined ? { remove: this.#removedOnRoot } : {}),
+						}
+					: this.#removedOnRoot !== undefined
+						? { remove: this.#removedOnRoot }
+						: null;
+			await this.#root.configure({ extensions: extensionChange }, context);
+
+			return this.getMcpStatus();
+		};
+
+		const chained = this.#mcpReconnectChain.then(run, run);
+		this.#mcpReconnectChain = chained.then(
+			() => undefined,
+			() => undefined,
+		);
+		return chained;
+	}
+
+	/** Returns the active runtime model status (combining persisted `RuntimeModelDoc` override and startup default). */
+	async getCurrentModel(context: Context): Promise<ModelStatusSummary> {
+		const doc = await this.#harness.snapshot(RuntimeModelDoc, context);
+		const override = doc?.override;
+		const isValidOverride =
+			override !== undefined && this.#models.getModel(override.provider, override.modelId) !== undefined;
+		const active = isValidOverride ? cloneModelRef(override) : cloneModelRef(this.#defaultModel);
+		return {
+			active,
+			defaultModel: cloneModelRef(this.#defaultModel),
+			isOverride: isValidOverride,
+			...(isValidOverride && doc?.updatedAtMs !== undefined ? { updatedAtMs: doc.updatedAtMs } : {}),
+			utcOffsetMinutes: this.#utcOffsetMinutes,
+		};
+	}
+
+	/** Lists chat models registered in `Models` (optionally filtered to a single `provider`). */
+	listAvailableModels(provider?: string): readonly AvailableModelEntry[] {
+		const trimmed = provider?.trim();
+		const models =
+			trimmed !== undefined && trimmed.length > 0 ? this.#models.getModels(trimmed) : this.#models.getModels();
+		return models.map((model) => ({
+			provider: model.provider,
+			modelId: model.id,
+			...(model.name.length > 0 ? { name: model.name } : {}),
+		}));
+	}
+
+	/** Validates `"<provider>/<modelId>"`, persists it to `RuntimeModelDoc`, and live-applies it on the root conversation. */
+	async setModel(modelSpec: string, context: Context): Promise<SetModelResult> {
+		const parsed = parseModelRefSpec(modelSpec);
+		if (parsed === undefined) {
+			return {
+				ok: false,
+				reason: "invalid_format",
+				message: `模型格式无效 "${modelSpec.trim()}"，请使用 "<provider>/<modelId>" 格式。`,
+			};
+		}
+		if (this.#models.getProvider(parsed.provider) === undefined) {
+			const known = this.#models
+				.getProviders()
+				.map((p) => p.id)
+				.join(", ");
+			return {
+				ok: false,
+				reason: "unknown_provider",
+				message: `未找到模型提供方 "${parsed.provider}"（已注册：${known || "none"}）。`,
+			};
+		}
+		if (this.#models.getModel(parsed.provider, parsed.modelId) === undefined) {
+			return {
+				ok: false,
+				reason: "unknown_model",
+				message: `提供方 "${parsed.provider}" 下不存在模型 "${parsed.modelId}"，请使用 /model list 查看可用列表。`,
+			};
+		}
+		const updatedAtMs = this.#now();
+		const previous = await this.#root.commit(async (tx) => {
+			const doc = await tx.doc(RuntimeModelDoc);
+			const prev = readRuntimeModelOverride(doc) ?? cloneModelRef(this.#defaultModel);
+			doc.override = { provider: parsed.provider, modelId: parsed.modelId };
+			doc.updatedAtMs = updatedAtMs;
+			return prev;
+		}, context);
+		await this.#root.configure({ model: parsed }, context);
+		this.#activeModelHolder.current = cloneModelRef(parsed);
+		return {
+			ok: true,
+			model: cloneModelRef(parsed),
+			previous,
+			updatedAtMs,
+		};
+	}
+
+	/** Clears any persisted `RuntimeModelDoc` override and restores the startup `defaultModel` live. */
+	async resetModel(context: Context): Promise<ResetModelResult> {
+		const wasOverride = await this.#root.commit(async (tx) => {
+			const doc = await tx.doc(RuntimeModelDoc);
+			const hadOverride = doc.override !== undefined;
+			delete doc.override;
+			delete doc.updatedAtMs;
+			return hadOverride;
+		}, context);
+		await this.#root.configure({ model: this.#defaultModel }, context);
+		this.#activeModelHolder.current = cloneModelRef(this.#defaultModel);
+		return {
+			ok: true,
+			model: cloneModelRef(this.#defaultModel),
+			wasOverride,
+		};
+	}
+
+	/** Registers the channel-layer handler delivering outbound photos/documents produced by `send_media`. */
+	onOutboundMedia(handler: OutboundMediaHandler): () => void {
+		this.#outboundMediaHandler.current = handler;
+		return () => {
+			if (this.#outboundMediaHandler.current === handler) {
+				this.#outboundMediaHandler.current = undefined;
+			}
+		};
+	}
+
+	/** Persists a deferred proactive notification into `HeldNotificationsDoc` and optionally schedules the quiet-end wake alarm. */
+	async appendHeldNotification(
+		item: HeldProactiveMessage,
+		context: Context,
+		quietEndMs?: number,
+	): Promise<HeldProactiveMessage> {
+		const nowMs = this.#now();
+		if (quietEndMs !== undefined) {
+			this.#quietHoursHolder.nextHintMs =
+				this.#quietHoursHolder.nextHintMs === undefined
+					? quietEndMs
+					: Math.min(this.#quietHoursHolder.nextHintMs, quietEndMs);
+		}
+		return this.#root.commit(async (tx) => {
+			const doc = await tx.doc(HeldNotificationsDoc);
+			const stored = appendHeldNotificationInState(doc, item);
+			if (quietEndMs !== undefined) {
+				await syncRoutineSchedulerInTx(tx, this.#routineSchedulerTask, nowMs, quietEndMs);
+			}
+			return stored;
+		}, context);
+	}
+
+	/** Reads durable held proactive notifications from `HeldNotificationsDoc` (optionally filtered to `routeFilter`). */
+	async listHeldNotifications(context: Context, routeFilter?: ChannelRoute): Promise<readonly HeldProactiveMessage[]> {
+		const doc = (await this.#harness.snapshot(HeldNotificationsDoc, context)) ?? createEmptyHeldNotificationsState();
+		return listHeldNotificationsFromState(doc, routeFilter);
+	}
+
+	/** Atomically drains held proactive notifications from `HeldNotificationsDoc` (all routes or `routeFilter`). */
+	async drainHeldNotifications(
+		context: Context,
+		routeFilter?: ChannelRoute,
+	): Promise<readonly HeldProactiveMessage[]> {
+		return this.#root.commit(async (tx) => {
+			const doc = await tx.doc(HeldNotificationsDoc);
+			const drained = drainHeldNotificationsInState(doc, routeFilter);
+			if (doc.items.length === 0) {
+				this.#quietHoursHolder.nextHintMs = undefined;
+			}
+			return drained;
+		}, context);
+	}
+
+	/** Subscribes to quiet-window-end auto-flush triggers emitted by the single-flight `RoutineSchedulerTask`. */
+	onQuietFlushDue(listener: QuietFlushListener, options?: QuietFlushSubscriptionOptions): () => void {
+		this.#quietFlushListeners.add(listener);
+		const registeredQuietHours = options?.quietHours;
+		if (registeredQuietHours !== undefined && this.#quietHoursHolder.current === undefined) {
+			this.#quietHoursHolder.current = registeredQuietHours;
+		}
+		return () => {
+			this.#quietFlushListeners.delete(listener);
+			if (registeredQuietHours !== undefined && this.#quietHoursHolder.current === registeredQuietHours) {
+				this.#quietHoursHolder.current = this.#initialQuietHours;
+			}
+		};
 	}
 
 	/** Configured fixed local UTC offset in minutes used for clock anchor and routines. */
@@ -1407,8 +1818,9 @@ export class JeheeHost {
 	}
 
 	/**
-	 * Waits until all currently due routine dispatches and active foreground/background work triggered by an alarm
-	 * have settled, without blocking on future recurring slots. Designed for Cloudflare DO `alarm()` `ctx.waitUntil`.
+	 * Waits until all currently due routine dispatches, quiet-hours auto-flushes, and active foreground/background work
+	 * triggered by an alarm have settled, without blocking on future recurring slots or retry backoffs.
+	 * Designed for Cloudflare DO `alarm()` `ctx.waitUntil`.
 	 */
 	async waitForDueRoutines(context: Context): Promise<void> {
 		await Promise.resolve();
@@ -1418,10 +1830,12 @@ export class JeheeHost {
 			await this.#root.waitForIdle(context);
 			const state = await this.#harness.snapshot(RoutineDoc, context);
 			const nowMs = this.#now();
-			const hasDueNow = Object.values(state?.items ?? {}).some(
+			const wake = this.#harness.wake();
+			const hasDueRoutine = Object.values(state?.items ?? {}).some(
 				(item) => item.enabled && item.nextRunAtMs !== undefined && item.nextRunAtMs <= nowMs + 250,
 			);
-			if (!hasDueNow && !this.#routineTracker.isDispatching() && !this.#harness.wake().active) {
+			const hasDueWake = wake.at !== undefined && wake.at <= nowMs + 250;
+			if (!hasDueRoutine && !hasDueWake && !this.#routineTracker.isDispatching() && !wake.active) {
 				break;
 			}
 			await new Promise((resolve) => setTimeout(resolve, 25));
@@ -1558,12 +1972,12 @@ export class JeheeHost {
 		};
 	}
 
-	/** Closes the underlying Harness, disconnects MCP servers, and releases storage locks cleanly. */
+	/** Closes the underlying Harness, disconnects the active MCP servers, and releases storage locks cleanly. */
 	async close(context: Context): Promise<void> {
 		try {
 			await this.#harness.close(context);
 		} finally {
-			await this.#mcpHub?.close();
+			await this.#mcpState.hub?.close();
 		}
 	}
 }

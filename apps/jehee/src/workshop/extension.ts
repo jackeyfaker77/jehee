@@ -21,6 +21,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { bool, obj, oneOf, opt, str } from "@earendil-works/pi-schema";
 import { JEHEE_CONTEXT_EXTENSION_HANDLE } from "../context/extension.ts";
+import { JEHEE_MEDIA_EXTENSION_HANDLE } from "../media/extension.ts";
 import { JEHEE_MEMORY_TOOLS_EXTENSION_HANDLE } from "../memory/bridge.ts";
 import { extractAssistantText } from "../memory/contract.ts";
 import { JEHEE_ROUTINES_EXTENSION_HANDLE } from "../routines/extension.ts";
@@ -567,6 +568,7 @@ export function createWorkshopBundle(options: WorkshopBundleOptions): WorkshopBu
 									JEHEE_CONTEXT_EXTENSION_HANDLE,
 									JEHEE_ROUTINES_EXTENSION_HANDLE,
 									JEHEE_WEB_EXTENSION_HANDLE,
+									JEHEE_MEDIA_EXTENSION_HANDLE,
 								],
 								add: [sandboxExtension!],
 							},

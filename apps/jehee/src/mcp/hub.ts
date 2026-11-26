@@ -1,11 +1,66 @@
 // Portable multi-server MCP client hub managing handshake, tool filtering, resource queries, and clean teardown.
 
 import { McpClient, mcpNamespace, mcpServerSummary, StreamableHttpTransport, type Tool } from "@earendil-works/pi-mcp";
-import type { ConnectedMcpServer, JeheeMcpServerSpec } from "./contract.ts";
+import type { ConnectedMcpServer, FailedMcpServer, JeheeMcpServerSpec } from "./contract.ts";
 
 const SERVER_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_SUMMARY_CHARS = 250;
+const MAX_ERROR_CHARS = 300;
+const SENSITIVE_NAME_PATTERN = /auth|token|key|secret|cookie|pass/i;
+
+function sanitizeMcpErrorMessage(error: unknown, spec: JeheeMcpServerSpec): string {
+	let message = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").trim();
+	if (spec.transport.kind === "http") {
+		try {
+			const parsedUrl = new URL(spec.transport.url);
+			if (parsedUrl.password.length > 0) {
+				if (parsedUrl.username.length > 0) {
+					message = message.replaceAll(`${parsedUrl.username}:${parsedUrl.password}`, "[redacted]");
+				}
+				message = message.replaceAll(parsedUrl.password, "[redacted]");
+			}
+			for (const [paramName, paramValue] of parsedUrl.searchParams.entries()) {
+				const trimmed = paramValue.trim();
+				if (trimmed.length === 0 || !SENSITIVE_NAME_PATTERN.test(paramName)) continue;
+				message = message.replaceAll(trimmed, "[redacted]");
+				const encoded = encodeURIComponent(trimmed);
+				if (encoded !== trimmed) {
+					message = message.replaceAll(encoded, "[redacted]");
+				}
+			}
+		} catch {
+			// Invalid URL string falls back to generic regex redaction below.
+		}
+		if (spec.transport.headers !== undefined) {
+			for (const [headerName, headerValue] of Object.entries(spec.transport.headers)) {
+				const trimmed = headerValue.trim();
+				if (trimmed.length === 0) continue;
+				const isSensitive = SENSITIVE_NAME_PATTERN.test(headerName) || /^(?:bearer|basic)\s+/i.test(trimmed);
+				if (!isSensitive) continue;
+				message = message.replaceAll(trimmed, "[redacted]");
+				const schemeSplit = /^[A-Za-z0-9_-]+\s+(.+)$/.exec(trimmed);
+				const tokenPart = schemeSplit?.[1]?.trim();
+				if (tokenPart !== undefined && tokenPart.length >= 4) {
+					message = message.replaceAll(tokenPart, "[redacted]");
+				}
+			}
+		}
+	}
+	message = message
+		.replace(/(https?:\/\/)([^/\s@]+)@/gi, "$1[redacted]@")
+		.replace(
+			/((?:["']?(?:proxy-)?authorization["']?)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|(?:bearer|basic)\s+[^\s,;}"']+|[^\s,;}"']+)/gi,
+			"$1[redacted]",
+		)
+		.replace(/(\b(?:bearer|basic)\s+)([^\s,;}"']+)/gi, "$1[redacted]")
+		.replace(
+			/((?:^|[\s?&;,{"'])(?:["']?(?:x-api-key|api[_-]?key|apikey|access[_-]?token|auth[_-]?token|client[_-]?secret|token|secret|cookie|password|passwd|auth|key)["']?)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,&;}"']+)/gi,
+			"$1[redacted]",
+		);
+	if (message.length === 0) return "Connection failed";
+	return message.length > MAX_ERROR_CHARS ? `${message.slice(0, MAX_ERROR_CHARS - 1).trimEnd()}…` : message;
+}
 
 function truncateSummary(summary: string): string {
 	const chars = [...summary];
@@ -58,11 +113,17 @@ export class McpConnectorHub {
 	readonly #servers: readonly ConnectedMcpServer[];
 	readonly #byName: ReadonlyMap<string, ConnectedMcpServer>;
 	readonly #clients: readonly McpClient[];
+	readonly #failedServers: readonly FailedMcpServer[];
 
-	private constructor(servers: readonly ConnectedMcpServer[], clients: readonly McpClient[]) {
+	private constructor(
+		servers: readonly ConnectedMcpServer[],
+		clients: readonly McpClient[],
+		failedServers: readonly FailedMcpServer[],
+	) {
 		this.#servers = servers;
 		this.#byName = new Map(servers.map((server) => [server.name, server]));
 		this.#clients = clients;
+		this.#failedServers = failedServers;
 	}
 
 	/** Connects and initializes configured MCP servers; when `bestEffort` is true, unreachable servers are skipped cleanly. */
@@ -74,6 +135,7 @@ export class McpConnectorHub {
 		const bestEffort = clientIdentity?.bestEffort === true;
 		const connectedClients: McpClient[] = [];
 		const servers: ConnectedMcpServer[] = [];
+		const failedServers: FailedMcpServer[] = [];
 
 		try {
 			for (const spec of specs) {
@@ -133,8 +195,9 @@ export class McpConnectorHub {
 					if (!bestEffort) {
 						throw error;
 					}
-					const detail = error instanceof Error ? error.message : String(error);
-					console.warn(`[jehee/mcp] skipped unreachable MCP server "${name}": ${detail}`);
+					const sanitizedError = sanitizeMcpErrorMessage(error, spec);
+					failedServers.push({ name, error: sanitizedError });
+					console.warn(`[jehee/mcp] skipped unreachable MCP server "${name}": ${sanitizedError}`);
 				}
 			}
 		} catch (error) {
@@ -142,12 +205,17 @@ export class McpConnectorHub {
 			throw error;
 		}
 
-		return new McpConnectorHub(servers, connectedClients);
+		return new McpConnectorHub(servers, connectedClients, failedServers);
 	}
 
 	/** Ordered list of connected MCP servers. */
 	servers(): readonly ConnectedMcpServer[] {
 		return this.#servers;
+	}
+
+	/** Ordered list of unreachable MCP servers skipped under `bestEffort: true` (with sanitized error messages). */
+	failedServers(): readonly FailedMcpServer[] {
+		return this.#failedServers;
 	}
 
 	/** Looks up a connected MCP server by its configured instance name. */

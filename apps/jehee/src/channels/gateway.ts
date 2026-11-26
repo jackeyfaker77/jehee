@@ -7,7 +7,19 @@ import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatHandoffReply } from "../context/handoff.ts";
 import type { JeheeHost, JeheePendingTurn } from "../core/host.ts";
 import type { ApprovalTicket } from "../governance/approvals.ts";
-import { ProactiveNotificationGovernor, type ProactiveQuietPolicy } from "../governance/quiet-gate.ts";
+import {
+	formatMcpStatusReply,
+	formatModelListReply,
+	formatModelRef,
+	formatModelStatusReply,
+} from "../governance/durable-store.ts";
+import {
+	formatHeldNotificationBatches,
+	type HeldProactiveMessage,
+	ProactiveNotificationGovernor,
+	type ProactiveQuietPolicy,
+} from "../governance/quiet-gate.ts";
+import type { OutboundMediaDeliveryResult, OutboundMediaPayload } from "../media/extension.ts";
 import { formatMemoryInspectReply, formatMemorySearchReply } from "../memory/atomic-memory.ts";
 import { formatConsolidationReportReply } from "../memory/consolidator.ts";
 import { renderPortableSnapshotMarkdown, serializePortableSnapshotJson } from "../memory/portable-snapshot.ts";
@@ -52,7 +64,9 @@ export type GatewaySlashCommand =
 	| "memory"
 	| "handoff"
 	| "trace"
-	| "routines";
+	| "routines"
+	| "mcp"
+	| "model";
 
 /** Outcome reported after ingesting or flushing an inbound message or button callback. */
 export type IngestResult =
@@ -106,6 +120,14 @@ function parseSlashCommand(trimmed: string): { readonly cmd: GatewaySlashCommand
 		const arg = trimmed.slice("/routines".length).trim();
 		return arg.length > 0 ? { cmd: "routines", arg } : { cmd: "routines" };
 	}
+	if (trimmed === "/mcp" || trimmed.startsWith("/mcp ")) {
+		const arg = trimmed.slice("/mcp".length).trim();
+		return arg.length > 0 ? { cmd: "mcp", arg } : { cmd: "mcp" };
+	}
+	if (trimmed === "/model" || trimmed.startsWith("/model ")) {
+		const arg = trimmed.slice("/model".length).trim();
+		return arg.length > 0 ? { cmd: "model", arg } : { cmd: "model" };
+	}
 	return undefined;
 }
 
@@ -133,9 +155,12 @@ export class ChannelGateway {
 	readonly #unsubscribeProactive: () => void;
 	readonly #unsubscribeDirectNotify: () => void;
 	readonly #unsubscribeApproval: () => void;
+	readonly #unsubscribeQuietFlush: () => void;
+	readonly #unsubscribeOutboundMedia: () => void;
 	#lastActiveRoute: ChannelRoute | undefined;
 	#blockedStagingDeliveries = 0;
 	#foregroundTurnCount = 0;
+	#cachedHeldCount = 0;
 
 	constructor(options: ChannelGatewayOptions) {
 		this.#host = options.host;
@@ -185,6 +210,21 @@ export class ChannelGateway {
 				],
 			});
 		});
+
+		this.#unsubscribeQuietFlush = this.#host.onQuietFlushDue(
+			async (nowMs, ctx) => {
+				if (!this.#governor.isOutsideQuietHours(nowMs)) return;
+				const outcome = await this.#flushHeldInternal(undefined, ctx);
+				if (outcome.firstError !== undefined) {
+					throw outcome.firstError;
+				}
+			},
+			this.#governor.quietHours !== undefined ? { quietHours: this.#governor.quietHours } : undefined,
+		);
+
+		this.#unsubscribeOutboundMedia = this.#host.onOutboundMedia((payload, ctx) =>
+			this.#handleOutboundMedia(payload, ctx),
+		);
 	}
 
 	/** Most recent authorized route that interacted with Jehee, used as default target for background notifications. */
@@ -197,9 +237,9 @@ export class ChannelGateway {
 		return this.#blockedStagingDeliveries;
 	}
 
-	/** Count of proactive background notifications currently held by quiet-hours, busy-yield, or cooldown rules. */
+	/** Last observed count of durable deferred proactive notifications held in `HeldNotificationsDoc`. */
 	get heldProactiveCount(): number {
-		return this.#governor.heldCount;
+		return this.#cachedHeldCount;
 	}
 
 	/** Registers or replaces an outbound transport for `transport.channel` (e.g. `"telegram"` or `"qq"`). */
@@ -227,9 +267,13 @@ export class ChannelGateway {
 			return this.#handleCommand(parsedCmd.cmd, parsedCmd.arg, message, context);
 		}
 
-		// When the owner interacts outside quiet hours, deliver any buffered background digests first.
-		if (this.#governor.heldCount > 0 && this.#governor.isOutsideQuietHours(this.#now())) {
-			await this.flushHeldNotifications(route);
+		// When the owner interacts outside quiet hours, deliver any buffered durable digests first.
+		if (this.#governor.isOutsideQuietHours(this.#now())) {
+			const held = await this.#host.listHeldNotifications(context);
+			this.#cachedHeldCount = held.length;
+			if (held.length > 0) {
+				await this.flushHeldNotifications(route, context);
+			}
 		}
 
 		const busy = await this.#host.isBusy(context);
@@ -310,18 +354,10 @@ export class ChannelGateway {
 		return admitted.settled;
 	}
 
-	/** Flushes deferred proactive notifications (for `route` or all routes) immediately, returning the count of flushed items. */
-	async flushHeldNotifications(route?: ChannelRoute): Promise<number> {
-		const batches = this.#governor.drainHeld(route);
-		let totalCount = 0;
-		for (const batch of batches) {
-			const sent = await this.#deliverOutbound(batch.route.channel, batch.route.chatId, batch.digestText);
-			if (sent) {
-				this.#governor.recordDelivered(batch.route, this.#now());
-				totalCount += batch.count;
-			}
-		}
-		return totalCount;
+	/** Flushes durable deferred proactive notifications (for `route` or all routes) immediately, preserving items whose delivery fails. */
+	async flushHeldNotifications(route?: ChannelRoute, context: Context = BACKGROUND_CONTEXT): Promise<number> {
+		const outcome = await this.#flushHeldInternal(route, context);
+		return outcome.deliveredCount;
 	}
 
 	/** Waits until all currently admitted or debounced background turns and outbound deliveries have settled. */
@@ -335,7 +371,8 @@ export class ChannelGateway {
 	 * Pushes a proactive or workshop notification out through a target route, subject to:
 	 * 1. Staging outbound route lock;
 	 * 2. `[SILENT]` sentinel suppression;
-	 * 3. Quiet-hours, busy-turn yield, and cooldown governance (unless `options?.urgency === "urgent"`).
+	 * 3. Quiet-hours, busy-turn yield, and cooldown governance backed by durable `HeldNotificationsDoc`
+	 *    (unless `options?.urgency === "urgent"`).
 	 */
 	async pushMessage(route: ChannelRoute, text: string, options?: ChannelSendOptions): Promise<boolean> {
 		if (!this.#isRouteAllowedInStaging(route.channel, route.chatId)) {
@@ -344,14 +381,29 @@ export class ChannelGateway {
 		}
 		const nowMs = this.#now();
 		const isBusy = this.#foregroundTurnCount > 0 || this.#buckets.size > 0;
-		const gate = this.#governor.evaluate({
+		const decision = this.#governor.classify({
 			route,
 			text,
 			...(options?.urgency !== undefined ? { urgency: options.urgency } : {}),
 			isBusy,
 			nowMs,
 		});
-		if (gate.action !== "deliver") {
+		if (decision.action === "drop_silent") {
+			return false;
+		}
+		if (decision.action === "hold") {
+			const quietEndMs = decision.reason === "quiet_hours" ? this.#governor.nextQuietEndMs(nowMs) : undefined;
+			await this.#host.appendHeldNotification(
+				{
+					route: { channel: route.channel, chatId: route.chatId },
+					text: text.trim(),
+					reason: decision.reason,
+					heldAtMs: nowMs,
+				},
+				BACKGROUND_CONTEXT,
+				quietEndMs,
+			);
+			this.#cachedHeldCount = (await this.#host.listHeldNotifications(BACKGROUND_CONTEXT)).length;
 			return false;
 		}
 		const delivered = await this.#deliverOutbound(route.channel, route.chatId, text, options);
@@ -366,7 +418,116 @@ export class ChannelGateway {
 		this.#unsubscribeProactive();
 		this.#unsubscribeDirectNotify();
 		this.#unsubscribeApproval();
+		this.#unsubscribeQuietFlush();
+		this.#unsubscribeOutboundMedia();
 		this.#cancelAllBuckets("disposed");
+	}
+
+	async #flushHeldInternal(
+		route: ChannelRoute | undefined,
+		context: Context,
+	): Promise<{ readonly deliveredCount: number; readonly failedCount: number; readonly firstError?: unknown }> {
+		const drained = await this.#host.drainHeldNotifications(context, route);
+		if (drained.length === 0) {
+			this.#cachedHeldCount = (await this.#host.listHeldNotifications(context)).length;
+			return { deliveredCount: 0, failedCount: 0 };
+		}
+
+		const grouped = new Map<string, { route: ChannelRoute; items: HeldProactiveMessage[] }>();
+		for (const item of drained) {
+			const key = formatRouteKey(item.route.channel, item.route.chatId);
+			let bucket = grouped.get(key);
+			if (bucket === undefined) {
+				bucket = { route: { channel: item.route.channel, chatId: item.route.chatId }, items: [] };
+				grouped.set(key, bucket);
+			}
+			bucket.items.push(item);
+		}
+
+		let deliveredCount = 0;
+		const failedItems: HeldProactiveMessage[] = [];
+		let firstError: unknown;
+
+		for (const group of grouped.values()) {
+			if (!this.#isRouteAllowedInStaging(group.route.channel, group.route.chatId)) {
+				this.#blockedStagingDeliveries += 1;
+				continue;
+			}
+			const batch = formatHeldNotificationBatches(group.items)[0];
+			if (batch === undefined) continue;
+			try {
+				const sent = await this.#deliverOutbound(batch.route.channel, batch.route.chatId, batch.digestText);
+				if (sent) {
+					this.#governor.recordDelivered(batch.route, this.#now());
+					deliveredCount += batch.count;
+				}
+			} catch (error) {
+				failedItems.push(...group.items);
+				if (firstError === undefined) firstError = error;
+			}
+		}
+
+		if (failedItems.length > 0) {
+			for (const item of failedItems) {
+				await this.#host.appendHeldNotification(item, context);
+			}
+		}
+
+		this.#cachedHeldCount = (await this.#host.listHeldNotifications(context)).length;
+		return {
+			deliveredCount,
+			failedCount: failedItems.length,
+			...(firstError !== undefined ? { firstError } : {}),
+		};
+	}
+
+	async #handleOutboundMedia(
+		payload: OutboundMediaPayload,
+		context: Context,
+		explicitRoute?: ChannelRoute,
+	): Promise<OutboundMediaDeliveryResult> {
+		const route = explicitRoute ?? (await this.#resolveProactiveRoute(context));
+		if (route === undefined) {
+			return { ok: false, reason: "No target messaging route available for outbound media delivery." };
+		}
+		const routeKey = formatRouteKey(route.channel, route.chatId);
+		if (!this.#isRouteAllowedInStaging(route.channel, route.chatId)) {
+			this.#blockedStagingDeliveries += 1;
+			return {
+				ok: false,
+				reason: `Outbound media delivery blocked by staging lock for route "${routeKey}".`,
+			};
+		}
+		const transport = this.#transports.get(route.channel);
+		if (transport === undefined) {
+			return { ok: false, reason: `No ChannelTransport registered for channel "${route.channel}".` };
+		}
+		try {
+			if (payload.kind === "photo") {
+				if (transport.sendPhoto === undefined) {
+					return { ok: false, reason: `Channel transport "${route.channel}" does not support sendPhoto.` };
+				}
+				await transport.sendPhoto(route.chatId, {
+					bytes: payload.bytes,
+					mimeType: payload.mimeType,
+					...(payload.fileName !== undefined ? { fileName: payload.fileName } : {}),
+					...(payload.caption !== undefined ? { caption: payload.caption } : {}),
+				});
+				return { ok: true, route: routeKey };
+			}
+			if (transport.sendDocument === undefined) {
+				return { ok: false, reason: `Channel transport "${route.channel}" does not support sendDocument.` };
+			}
+			await transport.sendDocument(route.chatId, {
+				bytes: payload.bytes,
+				mimeType: payload.mimeType,
+				fileName: payload.fileName,
+				...(payload.caption !== undefined ? { caption: payload.caption } : {}),
+			});
+			return { ok: true, route: routeKey };
+		} catch (error) {
+			return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+		}
 	}
 
 	async #resolveProactiveRoute(context: Context): Promise<ChannelRoute | undefined> {
@@ -424,8 +585,8 @@ export class ChannelGateway {
 		}
 
 		if (cmd === "flush") {
-			const flushed = await this.flushHeldNotifications({ channel: message.channel, chatId: message.chatId });
-			if (flushed === 0) {
+			const outcome = await this.#flushHeldInternal({ channel: message.channel, chatId: message.chatId }, context);
+			if (outcome.deliveredCount === 0 && outcome.failedCount === 0) {
 				await this.#deliverOutbound(message.channel, message.chatId, "当前没有暂存通知。", {
 					replyToMessageId: message.messageId,
 				});
@@ -486,12 +647,23 @@ export class ChannelGateway {
 			return this.#handleRoutinesCommand(arg, message, context);
 		}
 
+		if (cmd === "mcp") {
+			return this.#handleMcpCommand(arg, message, context);
+		}
+
+		if (cmd === "model") {
+			return this.#handleModelCommand(arg, message, context);
+		}
+
 		const busy = await this.#host.isBusy(context);
+		const currentModel = await this.#host.getCurrentModel(context);
 		const memoryId = this.#host.memoryProvider?.id ?? "none";
 		const mcpServers = this.#host.mcpServerNames;
 		const mcpLabel = mcpServers.length > 0 ? mcpServers.join(", ") : "none";
 		const pendingApprovals = await this.#host.listPendingApprovals(context);
 		const activeRoutines = await this.#host.listRoutines(context);
+		const heldItems = await this.#host.listHeldNotifications(context);
+		this.#cachedHeldCount = heldItems.length;
 		const contextStatus = await this.#host.getContextStatus(context);
 		const usage = await this.#host.getUsageSummary(context);
 		const cachePct = (usage.cacheHitRate * 100).toFixed(1);
@@ -499,12 +671,13 @@ export class ChannelGateway {
 		const statusText = [
 			`status: ${busy ? "busy" : "idle"}`,
 			`conversation: ${String(this.#host.rootConversationId)}`,
+			`model: ${formatModelRef(currentModel.active)}`,
 			`memory: ${memoryId}`,
 			`context: ${contextStatus.activeTokens}/${sweetSpotLabel} tok (handoffs=${contextStatus.totalHandoffs})`,
 			`mcp: ${mcpLabel}`,
 			`routines: ${activeRoutines.length}`,
 			`pending_approvals: ${pendingApprovals.length}`,
-			`held_proactive: ${this.#governor.heldCount}`,
+			`held_proactive: ${heldItems.length}`,
 			`cache_hit: ${cachePct}% (prefill=${usage.prefillTokens})`,
 			`cost_usd: ${usage.costUsd.toFixed(6)}`,
 		].join("\n");
@@ -512,6 +685,82 @@ export class ChannelGateway {
 			replyToMessageId: message.messageId,
 		});
 		return { settled: Promise.resolve({ kind: "command_handled", command: "status" }) };
+	}
+
+	async #handleMcpCommand(
+		arg: string | undefined,
+		message: InboundChannelMessage,
+		context: Context,
+	): Promise<AdmittedIngest> {
+		const sendOpts: ChannelSendOptions = { replyToMessageId: message.messageId };
+		const trimmed = (arg ?? "").trim().toLowerCase();
+
+		if (trimmed.length === 0 || trimmed === "status") {
+			const status = this.#host.getMcpStatus();
+			await this.#deliverOutbound(message.channel, message.chatId, formatMcpStatusReply(status), sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "mcp" }) };
+		}
+
+		if (trimmed === "reconnect") {
+			const report = await this.#host.reconnectMcp(context);
+			await this.#deliverOutbound(
+				message.channel,
+				message.chatId,
+				formatMcpStatusReply({ ...report, reconnected: true }),
+				sendOpts,
+			);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "mcp" }) };
+		}
+
+		await this.#deliverOutbound(message.channel, message.chatId, "用法：/mcp [reconnect]", sendOpts);
+		return { settled: Promise.resolve({ kind: "command_handled", command: "mcp" }) };
+	}
+
+	async #handleModelCommand(
+		arg: string | undefined,
+		message: InboundChannelMessage,
+		context: Context,
+	): Promise<AdmittedIngest> {
+		const sendOpts: ChannelSendOptions = { replyToMessageId: message.messageId };
+		const trimmed = (arg ?? "").trim();
+
+		if (trimmed.length === 0) {
+			const status = await this.#host.getCurrentModel(context);
+			await this.#deliverOutbound(message.channel, message.chatId, formatModelStatusReply(status), sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "model" }) };
+		}
+
+		const spaceIdx = trimmed.indexOf(" ");
+		const sub = (spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx)).toLowerCase();
+		const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+
+		if (sub === "list") {
+			const status = await this.#host.getCurrentModel(context);
+			const models = this.#host.listAvailableModels(rest.length > 0 ? rest : undefined);
+			await this.#deliverOutbound(
+				message.channel,
+				message.chatId,
+				formatModelListReply(models, status.active),
+				sendOpts,
+			);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "model" }) };
+		}
+
+		if (sub === "reset") {
+			const reset = await this.#host.resetModel(context);
+			const reply = reset.wasOverride
+				? `[Model] 已恢复默认模型：${formatModelRef(reset.model)}`
+				: `[Model] 当前已是默认模型：${formatModelRef(reset.model)}`;
+			await this.#deliverOutbound(message.channel, message.chatId, reply, sendOpts);
+			return { settled: Promise.resolve({ kind: "command_handled", command: "model" }) };
+		}
+
+		const updated = await this.#host.setModel(trimmed, context);
+		const reply = updated.ok
+			? `[Model] 已切换模型：${formatModelRef(updated.model)}（原模型：${formatModelRef(updated.previous)}）`
+			: `[Model] 切换失败：${updated.message}`;
+		await this.#deliverOutbound(message.channel, message.chatId, reply, sendOpts);
+		return { settled: Promise.resolve({ kind: "command_handled", command: "model" }) };
 	}
 
 	async #handleRoutinesCommand(
