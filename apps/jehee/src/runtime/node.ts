@@ -194,6 +194,7 @@ export async function assembleNodeRuntime(
 			utcOffsetMinutes: config.utcOffsetMinutes,
 			enableRoutines: true,
 			enableMedia: true,
+			...(config.webSearch !== undefined ? { webSearch: config.webSearch } : {}),
 			...(config.quietPolicy?.quietHours !== undefined ? { quietHours: config.quietPolicy.quietHours } : {}),
 			autoResume: false,
 			...(mcp !== undefined ? { mcp } : {}),

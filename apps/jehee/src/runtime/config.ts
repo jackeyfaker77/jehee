@@ -55,6 +55,14 @@ export type JeheeRuntimeConfig = {
 	readonly mcpExposure?: JeheeMcpExposure;
 	readonly writeGate?: WriteApprovalPolicy;
 	readonly quietPolicy?: ProactiveQuietPolicy;
+	/** Optional live `web_search` configuration parsed from `TINYFISH_API_KEY`. */
+	readonly webSearch?: {
+		readonly provider: "tinyfish";
+		readonly apiKey: string;
+		readonly baseUrl?: string;
+		readonly defaultLanguage?: string;
+		readonly defaultLocation?: string;
+	};
 	/** Parsed fixed UTC offset in minutes from `JEHEE_TZ_OFFSET` (defaults to `+08:00` = `480`). */
 	readonly utcOffsetMinutes: number;
 };
@@ -293,6 +301,25 @@ export function parseJeheeEnvConfig(
 		...(handoffModel !== undefined ? { model: handoffModel } : {}),
 	});
 
+	const tinyfishApiKey = env.TINYFISH_API_KEY?.trim();
+	const tinyfishBaseUrl = env.TINYFISH_SEARCH_BASE_URL?.trim();
+	const webSearchLanguage = env.JEHEE_WEB_SEARCH_LANGUAGE?.trim();
+	const webSearchLocation = env.JEHEE_WEB_SEARCH_LOCATION?.trim();
+	const webSearch =
+		tinyfishApiKey !== undefined && tinyfishApiKey.length > 0
+			? {
+					provider: "tinyfish" as const,
+					apiKey: tinyfishApiKey,
+					...(tinyfishBaseUrl !== undefined && tinyfishBaseUrl.length > 0 ? { baseUrl: tinyfishBaseUrl } : {}),
+					...(webSearchLanguage !== undefined && webSearchLanguage.length > 0
+						? { defaultLanguage: webSearchLanguage }
+						: {}),
+					...(webSearchLocation !== undefined && webSearchLocation.length > 0
+						? { defaultLocation: webSearchLocation }
+						: {}),
+				}
+			: undefined;
+
 	return {
 		defaultModel,
 		instructions: env.JEHEE_INSTRUCTIONS?.trim() || DEFAULT_JEHEE_INSTRUCTIONS,
@@ -314,6 +341,7 @@ export function parseJeheeEnvConfig(
 		...(mcpExposure !== undefined ? { mcpExposure } : {}),
 		...(writeGate !== undefined ? { writeGate } : {}),
 		...(quietPolicy !== undefined ? { quietPolicy } : {}),
+		...(webSearch !== undefined ? { webSearch } : {}),
 		utcOffsetMinutes,
 	};
 }

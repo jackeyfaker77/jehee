@@ -59,6 +59,10 @@ export type JeheeWorkerEnv = {
 	readonly JEHEE_QUIET_HOURS?: string;
 	readonly JEHEE_TZ_OFFSET?: string;
 	readonly JEHEE_PROACTIVE_COOLDOWN_MS?: string;
+	readonly TINYFISH_API_KEY?: string;
+	readonly TINYFISH_SEARCH_BASE_URL?: string;
+	readonly JEHEE_WEB_SEARCH_LANGUAGE?: string;
+	readonly JEHEE_WEB_SEARCH_LOCATION?: string;
 };
 
 const RECOVERY_HEARTBEAT_MS = 60_000;
@@ -170,6 +174,7 @@ export class JeheeSessionDO extends DurableObject<JeheeWorkerEnv> {
 					utcOffsetMinutes: config.utcOffsetMinutes,
 					enableRoutines: true,
 					enableMedia: true,
+					...(config.webSearch !== undefined ? { webSearch: config.webSearch } : {}),
 					...(config.quietPolicy?.quietHours !== undefined ? { quietHours: config.quietPolicy.quietHours } : {}),
 					autoResume: false,
 					...(workerMcp !== undefined ? { mcp: workerMcp } : {}),

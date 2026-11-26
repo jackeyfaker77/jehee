@@ -406,10 +406,12 @@ export {
 } from "./telemetry/recorder.ts";
 export {
 	type CreateWebExtensionOptions,
+	type CreateWebSearchToolOptions,
 	createWebExtension,
 	JEHEE_WEB_EXTENSION_HANDLE,
 	JEHEE_WEB_EXTENSION_NAME,
 	WEB_FETCH_TOOL,
+	WEB_SEARCH_TOOL,
 } from "./web/extension.ts";
 export {
 	DEFAULT_WEB_FETCH_MAX_BYTES,
@@ -426,6 +428,21 @@ export {
 	type WebFetchOptions,
 	type WebFetchResult,
 } from "./web/web-fetch.ts";
+export {
+	DEFAULT_TINYFISH_SEARCH_URL,
+	DEFAULT_WEB_SEARCH_MAX_RESULTS,
+	DEFAULT_WEB_SEARCH_MAX_SNIPPET_CHARS,
+	DEFAULT_WEB_SEARCH_TIMEOUT_MS,
+	MAX_WEB_SEARCH_QUERY_CHARS,
+	MAX_WEB_SEARCH_RESPONSE_BYTES,
+	MAX_WEB_SEARCH_RESULTS_CAP,
+	searchWeb,
+	type WebSearchDomainType,
+	type WebSearchHit,
+	type WebSearchOptions,
+	type WebSearchQueryInput,
+	type WebSearchResult,
+} from "./web/web-search.ts";
 export {
 	buildGitSummaryBlock,
 	filterGitStatusShortLines,

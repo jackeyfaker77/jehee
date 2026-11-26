@@ -149,7 +149,12 @@ import {
 	TraceDoc,
 } from "../telemetry/durable-store.ts";
 import { JeheeTraceRecorder, startJeheeMemorySpan } from "../telemetry/recorder.ts";
-import { type CreateWebExtensionOptions, createWebExtension, JEHEE_WEB_EXTENSION_NAME } from "../web/extension.ts";
+import {
+	type CreateWebExtensionOptions,
+	type CreateWebSearchToolOptions,
+	createWebExtension,
+	JEHEE_WEB_EXTENSION_NAME,
+} from "../web/extension.ts";
 import type { WorkshopExecutionBackend } from "../workshop/backend.ts";
 import type { CustomCodingAgentTemplate, WorkshopDriverName } from "../workshop/coding-agent-driver.ts";
 import { createWorkshopBundle, type WorkshopBundle, WorkshopRegistryDoc } from "../workshop/extension.ts";
@@ -186,6 +191,8 @@ export type JeheeHostOptions = {
 	readonly enableWebFetch?: boolean;
 	/** Optional configuration overrides for the built-in `"jehee.web"` (`web_fetch`) extension. */
 	readonly webFetch?: CreateWebExtensionOptions;
+	/** Optional live `web_search` configuration (TinyFish TinySearch) mounted inside `"jehee.web"`. */
+	readonly webSearch?: CreateWebSearchToolOptions;
 	/** Explicit toggle for eager `send_media` tool. Defaults to enabled when routines, atomic memory, or handoff is mounted. */
 	readonly enableMedia?: boolean;
 	/** Optional quiet-hours window used by the durable scheduler to compute automatic quiet-end flush wakeups. */
@@ -654,10 +661,12 @@ export class JeheeHost {
 				options.enableWebFetch ??
 				options.webFetch?.enabled ??
 				(options.enableRoutines === true || options.memory?.atomic !== undefined || options.handoff !== undefined);
+			const effectiveWebSearch = options.webSearch ?? options.webFetch?.webSearch;
 			registry.install(
 				createWebExtension({
 					...options.webFetch,
 					enabled: enableWebFetch,
+					...(effectiveWebSearch !== undefined ? { webSearch: effectiveWebSearch } : {}),
 				}),
 			);
 		}
